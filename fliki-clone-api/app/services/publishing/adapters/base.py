@@ -14,6 +14,19 @@ from datetime import datetime
 from typing import Any, Callable, Optional, Type
 
 
+# Track-13：上传进度回调 payload 形态约定
+# {
+#   "phase": "downloading" | "uploading",
+#   "bytes_uploaded": int,
+#   "total": int,
+#   "percent": float,                       # 0.0–100.0
+#   "chunk_index": int,                     # 0-based；downloading 阶段为 -1
+#   "chunk_count": int,                     # downloading 阶段为 0
+# }
+ProgressInfo = dict[str, Any]
+ProgressCb = Callable[[ProgressInfo], None]
+
+
 @dataclass
 class PublishRequest:
     """提交给 adapter 的所有上下文（DB 已读出来的扁平视图）。"""
@@ -39,6 +52,12 @@ class PublishRequest:
     # 安全闸门：默认 False = adapter 走 mock / dry-run；True = adapter 真打外部 API
     # （Track-02：替代 v1 的 plan.meta_json.confirm_real_publish 隐藏字段）
     confirm_real_publish: bool = False
+    # Track-13：分片上传进度回调；executor 注入，把进度落 publish_plans.meta_json
+    # + 推 SSE upload_progress 事件给前端进度条用。
+    # 不参与 dataclass 比较 / 序列化（callable 不可 JSON 化）。
+    progress_cb: Optional[ProgressCb] = field(
+        default=None, repr=False, compare=False
+    )
 
 
 @dataclass
@@ -121,6 +140,8 @@ def list_supported_platforms() -> list[dict[str, Any]]:
 
 __all__ = [
     "PlatformAdapter",
+    "ProgressCb",
+    "ProgressInfo",
     "PublishError",
     "PublishOutcome",
     "PublishRequest",

@@ -11,11 +11,19 @@ import { listFilePublishPlans, PublishPlanOut } from "@/lib/production";
  * 改用 EventSource 订阅 `/api/production/publish-plans/{id}/events` 拉
  * `publish_plan_state` 事件，实时把 Upload 按钮从 loading 转到终态。
  *
- * 协议（与后端 `app/routers/production.py` 对齐）：
+ * Track-13 扩展：YouTube adapter 改成 8 MiB chunked PUT 后，每片完会推
+ * `upload_progress` 事件（含 percent / bytes_uploaded / total / chunk_index）
+ * 让 PlanRow 渲一根进度条；`upload_progress` 不是终态事件（终态仍走
+ * `publish_plan_state.phase=completed/system_error`）。
+ *
+ * 协议（与后端 `app/routers/production.py` + `services/publishing/executor.py` 对齐）：
  *   - event: snapshot              data: <PublishPlanOut>           连接首条；用它对齐全量
  *   - event: publish_plan_state    data: <PublishPlanStateEvent>    单事件
  *       phase ∈ "running" | "completed" | "system_error"
  *       completed 时 ok / status / external_id 已写回 plan，前端再拉一次列表拿权威值
+ *   - event: upload_progress       data: <UploadProgressEvent>      Track-13：分片进度
+ *       phase ∈ "downloading" | "uploading"
+ *       uploading 阶段每完成一片推一次；percent 0-100；非终态
  *   - 注释行 `: ping`                                                心跳；EventSource 自动忽略
  *
  * 行为：
@@ -54,6 +62,24 @@ export interface PublishPlanStateEvent {
   error?: string | null;
 }
 
+/**
+ * Track-13：分片上传进度事件 payload。
+ * 由 youtube adapter 每完成一片调用 executor 注入的 progress_cb 后，
+ * 通过 SSE 频道 `publish:plan:{id}` 推送过来。
+ *
+ * - `phase=downloading`：adapter 正在把 render_url 下载到内存；只发 1-2 次（开始/完成）
+ * - `phase=uploading`：每个 chunk_size（默认 8 MiB）一次；percent 单调递增到 100
+ */
+export interface UploadProgressEvent {
+  plan_id: string;
+  phase: "downloading" | "uploading";
+  bytes_uploaded: number;
+  total: number;
+  percent: number;
+  chunk_index: number;
+  chunk_count: number;
+}
+
 export interface PublishPlanStreamHandle {
   /** 当前 hook 的状态：未连 / SSE / polling */
   mode: PublishPlanStreamMode;
@@ -63,6 +89,8 @@ export interface PublishPlanStreamHandle {
   latestEvent: PublishPlanStateEvent | null;
   /** 最近一次 snapshot（异步路径返 202 时也只有这个 plan 视图最新） */
   latestPlan: PublishPlanOut | null;
+  /** Track-13：最近一次 upload_progress 事件；null = 还没开始分片上传 */
+  latestProgress: UploadProgressEvent | null;
   /** 启动订阅；planId 必填，fileId 用于 polling fallback */
   start: (planId: string, fileId?: string | null) => void;
   /** 主动停（不用等终态） */
@@ -76,6 +104,8 @@ export interface UsePublishPlanStreamArgs {
   onSnapshot?: (plan: PublishPlanOut) => void;
   /** 收到任何 publish_plan_state 事件时回调（含 running） */
   onEvent?: (event: PublishPlanStateEvent) => void;
+  /** Track-13：收到 upload_progress 事件时回调（典型用法：自定义打点 / 分析） */
+  onUploadProgress?: (event: UploadProgressEvent) => void;
 }
 
 export function usePublishPlanStream(
@@ -86,14 +116,19 @@ export function usePublishPlanStream(
   const [latestEvent, setLatestEvent] =
     useState<PublishPlanStateEvent | null>(null);
   const [latestPlan, setLatestPlan] = useState<PublishPlanOut | null>(null);
+  // Track-13：upload_progress 单事件态；下次 start() 重置回 null
+  const [latestProgress, setLatestProgress] =
+    useState<UploadProgressEvent | null>(null);
 
   // 回调挂 ref 避免每次 render 重建 EventSource
   const onTerminalRef = useRef(args.onTerminal);
   const onSnapshotRef = useRef(args.onSnapshot);
   const onEventRef = useRef(args.onEvent);
+  const onUploadProgressRef = useRef(args.onUploadProgress);
   onTerminalRef.current = args.onTerminal;
   onSnapshotRef.current = args.onSnapshot;
   onEventRef.current = args.onEvent;
+  onUploadProgressRef.current = args.onUploadProgress;
 
   // 当前活跃订阅的句柄（外部 start/stop 共享）
   const sessionRef = useRef<{
@@ -179,6 +214,7 @@ export function usePublishPlanStream(
     session.closed = false;
     session.consecutiveErrors = 0;
     setLatestEvent(null);
+    setLatestProgress(null);
     setPending(true);
 
     const base =
@@ -231,6 +267,20 @@ export function usePublishPlanStream(
       }
     });
 
+    // Track-13：分片上传进度事件（非终态；用于驱动 PlanRow 进度条）
+    es.addEventListener("upload_progress", (ev) => {
+      session.consecutiveErrors = 0;
+      try {
+        const payload = JSON.parse(
+          (ev as MessageEvent).data
+        ) as UploadProgressEvent;
+        setLatestProgress(payload);
+        onUploadProgressRef.current?.(payload);
+      } catch {
+        /* ignore malformed */
+      }
+    });
+
     es.addEventListener("error", () => {
       // SSE 重连机制不可靠（鉴权过期 / 后端重启 / redis 抖动）；自己计数 fallback
       session.consecutiveErrors += 1;
@@ -252,5 +302,13 @@ export function usePublishPlanStream(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  return { mode, pending, latestEvent, latestPlan, start, stop };
+  return {
+    mode,
+    pending,
+    latestEvent,
+    latestPlan,
+    latestProgress,
+    start,
+    stop,
+  };
 }
