@@ -41,6 +41,8 @@ _PRICE_TABLE: dict[tuple[ProviderName, ModelAction], float] = {
     (ProviderName.OPENAI, ModelAction.LLM): 0.005,
     # OpenAI Whisper-1 公开报价：$0.006/min
     (ProviderName.OPENAI, ModelAction.ASR): 0.006,
+    # faster-whisper 本地推理零外部成本（占 CPU/RAM，调用方自行感知冷启动延迟）
+    (ProviderName.FASTER_WHISPER_LOCAL, ModelAction.ASR): 0.0,
 }
 
 

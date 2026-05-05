@@ -16,6 +16,7 @@ from typing import Optional
 from .cost import estimate_cost, record_call
 from .providers import (
     BaseProvider,
+    FasterWhisperLocalProvider,
     KlingProvider,
     OpenAICompatLLMProvider,
     OpenAIWhisperProvider,
@@ -45,8 +46,15 @@ class Gateway:
             ModelAction.IMAGE_TO_VIDEO: [ProviderName.KLING],
             ModelAction.GENERATE_IMAGE: [ProviderName.SILICONFLOW],
             ModelAction.TTS: [ProviderName.ELEVENLABS, ProviderName.SILICONFLOW],
-            # 优先 OpenAI Whisper（拿 word-level）；缺 OPENAI_API_KEY 自动 fallback 到 SiliconFlow SenseVoice
-            ModelAction.ASR: [ProviderName.OPENAI, ProviderName.SILICONFLOW],
+            # ASR 三段降级：
+            #   1. OpenAI Whisper-1（云端 word-level，最稳）
+            #   2. faster-whisper 本地（缺 OPENAI_API_KEY 时的离线 word-level fallback）
+            #   3. SiliconFlow SenseVoice（无 word；voice agent 自动退到 v3 行级）
+            ModelAction.ASR: [
+                ProviderName.OPENAI,
+                ProviderName.FASTER_WHISPER_LOCAL,
+                ProviderName.SILICONFLOW,
+            ],
         }
 
     def register(self, provider: BaseProvider) -> None:
@@ -224,6 +232,7 @@ def get_gateway() -> Gateway:
             gw.register(SiliconFlowTTSProvider())
             gw.register(SiliconFlowASRProvider())
             gw.register(OpenAIWhisperProvider())
+            gw.register(FasterWhisperLocalProvider())
             _gateway = gw
     return _gateway
 
