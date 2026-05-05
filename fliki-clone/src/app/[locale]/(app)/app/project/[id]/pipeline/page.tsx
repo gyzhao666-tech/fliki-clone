@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import {
   AlertTriangle,
@@ -45,6 +45,11 @@ import {
   startPipeline,
 } from "@/lib/pipelines";
 import { usePipelineStream } from "@/hooks/use-pipeline-stream";
+import {
+  useAudioCurrentWord,
+  type SubtitleWithWords,
+  type WordTimestamp,
+} from "@/hooks/use-audio-current-word";
 import { useRunRenders } from "@/hooks/use-run-renders";
 import { useRunShotList } from "@/hooks/use-run-shot-list";
 import { useDlq } from "@/hooks/use-dlq";
@@ -1638,247 +1643,12 @@ function StepArtifacts({
   }
 
   if (step.agent_type === "voice") {
-    const charCount =
-      typeof out.char_count === "number" ? (out.char_count as number) : null;
-    const totalDur =
-      typeof out.total_duration_s === "number"
-        ? (out.total_duration_s as number)
-        : null;
-    const audioDur =
-      typeof out.audio_duration_s === "number"
-        ? (out.audio_duration_s as number)
-        : null;
-    const aligned = out.aligned === true;
-    const alignmentSource =
-      typeof out.alignment_source === "string"
-        ? (out.alignment_source as string)
-        : null;
-    const asrProvider =
-      typeof out.asr_provider === "string"
-        ? (out.asr_provider as string)
-        : null;
-    const asrModel =
-      typeof out.asr_model === "string" ? (out.asr_model as string) : null;
-    const asrMs =
-      typeof out.asr_duration_ms === "number"
-        ? (out.asr_duration_ms as number)
-        : null;
-    const asrSegments =
-      typeof out.asr_segments_count === "number"
-        ? (out.asr_segments_count as number)
-        : null;
-    const alignWarning =
-      typeof out.align_warning === "string"
-        ? (out.align_warning as string)
-        : null;
-    // v3 字段
-    const subtitleGranularity =
-      typeof out.subtitle_granularity === "string"
-        ? (out.subtitle_granularity as string)
-        : null;
-    const linesPerShot = Array.isArray(out.subtitle_lines_per_shot)
-      ? (out.subtitle_lines_per_shot as number[])
-      : null;
-    const subtitleMaxChars =
-      typeof out.subtitle_max_chars === "number"
-        ? (out.subtitle_max_chars as number)
-        : null;
-    // v4 字段
-    const alignmentQuality =
-      typeof out.subtitle_alignment_quality === "string"
-        ? (out.subtitle_alignment_quality as string)
-        : null;
-    const asrWordsCount =
-      typeof out.asr_words_count === "number"
-        ? (out.asr_words_count as number)
-        : null;
     return (
-      <div className="flex flex-col gap-2 text-xs">
-        {narrationUrl ? (
-          <audio
-            src={narrationUrl}
-            controls
-            className="w-full max-w-md"
-            preload="none"
-          />
-        ) : (
-          <div className="rounded bg-amber-500/10 px-2 py-1 text-amber-500">
-            未生成旁白音频（{(out.warning as string) || "TTS 未启用或失败"}）
-          </div>
-        )}
-        <div className="flex flex-wrap items-center gap-1.5">
-          {aligned ? (
-            <span
-              className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-500"
-              title={
-                alignmentSource === "asr"
-                  ? "字幕已按 ASR 真实音频时长重切（v2+）"
-                  : alignmentSource === "ffprobe"
-                  ? "字幕已按 ffprobe 真实音频时长重切（ASR 缺 duration 时兜底）"
-                  : "字幕已对齐真实音频"
-              }
-            >
-              字幕已对齐 ✓ {alignmentSource ? `(${alignmentSource})` : ""}
-            </span>
-          ) : narrationUrl ? (
-            <span
-              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-500"
-              title={alignWarning ?? "ASR / ffprobe 都未拿到真实时长，回退 v1 按 shots.duration_s 均分"}
-            >
-              字幕未对齐（v1 均分）
-            </span>
-          ) : null}
-          {subtitleGranularity === "word" ? (
-            <span
-              className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-400"
-              title={
-                "字幕粒度：word 级 (v4)。每条字幕的 start/end 用 ASR word timestamp 强对齐；" +
-                "前端可做卡拉 OK 高亮（hover 字幕条看 word 时间轴）" +
-                (asrWordsCount ? `；asr 返 ${asrWordsCount} words` : "")
-              }
-            >
-              word v4{asrWordsCount ? ` · ${asrWordsCount} words` : ""}
-              {linesPerShot ? ` · ${linesPerShot.join("/")}条` : ""}
-            </span>
-          ) : subtitleGranularity === "line" ? (
-            <span
-              className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] text-sky-500"
-              title={
-                "字幕粒度：行级 (v3)。按句号 / 逗号把每镜 narration 切成多条，更符合阅读节奏" +
-                (subtitleMaxChars ? `；上限 ${subtitleMaxChars} 字/条` : "")
-              }
-            >
-              行级 v3{linesPerShot ? ` · ${linesPerShot.join("/")}条` : ""}
-            </span>
-          ) : subtitleGranularity === "shot" ? (
-            <span
-              className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-              title="字幕粒度：镜头级 (v2)。每镜 narration 太短，没触发行级细切"
-            >
-              镜级 v2
-            </span>
-          ) : subtitleGranularity === "merged" ? (
-            <span
-              className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-              title="字幕粒度：v1 兜底。ASR/ffprobe 都失败时按 shots.duration_s 均分"
-            >
-              v1 兜底
-            </span>
-          ) : null}
-          {alignmentQuality && alignmentQuality !== subtitleGranularity ? (
-            <span
-              className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
-              title="对齐精度档位：word > segment > char-ratio > shots-duration"
-            >
-              align: {alignmentQuality}
-            </span>
-          ) : null}
-        </div>
-        <div className="text-muted-foreground">
-          voice <code className="font-mono">{(out.voice as string) || "—"}</code>{" "}
-          · model{" "}
-          <code className="font-mono">
-            {(out.voice_model as string) || "—"}
-          </code>
-          {charCount != null ? ` · ${charCount} 字` : ""}
-          {totalDur != null ? ` · 字幕轨 ${totalDur.toFixed(1)}s` : ""}
-          {audioDur != null ? ` · 旁白真长 ${audioDur.toFixed(1)}s` : ""}
-          {totalDur != null && audioDur != null
-            ? ` · 偏差 ${Math.abs(totalDur - audioDur).toFixed(2)}s`
-            : ""}
-        </div>
-        {asrProvider || asrModel ? (
-          <div className="text-[11px] text-muted-foreground">
-            ASR{" "}
-            <code className="font-mono">{asrProvider ?? "—"}</code>
-            {asrModel ? (
-              <>
-                {" / "}
-                <code className="font-mono">{asrModel}</code>
-              </>
-            ) : null}
-            {asrMs != null ? ` · ${asrMs}ms` : ""}
-            {asrSegments != null ? ` · ${asrSegments} segments` : ""}
-          </div>
-        ) : null}
-        {alignWarning ? (
-          <div className="rounded bg-amber-500/10 px-2 py-1 text-[11px] text-amber-500">
-            对齐告警：{alignWarning}
-          </div>
-        ) : null}
-        {subtitles?.length ? (
-          <details className="rounded bg-muted/30 p-2">
-            <summary className="cursor-pointer text-muted-foreground">
-              字幕（{subtitles.length} 条
-              {linesPerShot && linesPerShot.length
-                ? ` · ${linesPerShot.length} 镜`
-                : ""}
-              ）
-            </summary>
-            <ul className="mt-2 flex flex-col gap-1 text-foreground">
-              {subtitles.slice(0, 18).map((s, i) => {
-                const shotIdx =
-                  typeof s.shot_index === "number" ? (s.shot_index as number) : null;
-                const wordsRaw = Array.isArray(s.words)
-                  ? (s.words as Array<{ start: number; end: number; word: string }>)
-                  : [];
-                return (
-                  <li key={i} className="flex flex-col gap-0.5">
-                    <div className="flex items-baseline gap-1.5">
-                      {shotIdx != null ? (
-                        <span
-                          className="shrink-0 rounded bg-muted/40 px-1 text-[10px] text-muted-foreground"
-                          title={`shot ${shotIdx}`}
-                        >
-                          S{shotIdx}
-                        </span>
-                      ) : null}
-                      <span className="font-mono text-muted-foreground">
-                        {formatTimeRange(s.start, s.end)}
-                      </span>
-                      <span>{(s.text as string) || ""}</span>
-                      {wordsRaw.length ? (
-                        <span
-                          className="ml-auto rounded bg-violet-500/15 px-1 text-[10px] text-violet-600 dark:text-violet-400"
-                          title={`v4 word-level：${wordsRaw.length} 个 word，hover 时间轴看每词起止`}
-                        >
-                          {wordsRaw.length} words
-                        </span>
-                      ) : null}
-                    </div>
-                    {wordsRaw.length ? (
-                      <div
-                        className="ml-2 flex flex-wrap gap-0.5 text-[10px] text-violet-600/80 dark:text-violet-400/80"
-                        title="word-by-word 时间戳；前端可联动 audio 高亮"
-                      >
-                        {wordsRaw.slice(0, 16).map((w, wi) => (
-                          <span
-                            key={wi}
-                            className="rounded border border-violet-500/20 bg-violet-500/5 px-1 font-mono"
-                            title={`${w.start.toFixed(2)}-${w.end.toFixed(2)}s`}
-                          >
-                            {w.word}
-                          </span>
-                        ))}
-                        {wordsRaw.length > 16 ? (
-                          <span className="text-muted-foreground">
-                            …+{wordsRaw.length - 16}
-                          </span>
-                        ) : null}
-                      </div>
-                    ) : null}
-                  </li>
-                );
-              })}
-              {subtitles.length > 18 ? (
-                <li className="text-[11px] text-muted-foreground">
-                  …还有 {subtitles.length - 18} 条
-                </li>
-              ) : null}
-            </ul>
-          </details>
-        ) : null}
-      </div>
+      <VoiceArtifact
+        out={out}
+        narrationUrl={narrationUrl}
+        subtitles={subtitles}
+      />
     );
   }
 
@@ -1927,6 +1697,334 @@ function StepArtifacts({
   }
 
   return null;
+}
+
+/**
+ * VoiceArtifact —— Voice step 卡片渲染。
+ *
+ * Track-26 / L-02：在已有的「字幕条 + word 时间轴小卡片」之上，挂 `useAudioCurrentWord`
+ * 让前端跟随 `<audio>` 的 `currentTime` 实时高亮当前字幕条 + 当前 word（卡拉 OK 视觉）。
+ *
+ * 仅 v4 word-level 字幕（`subtitle_granularity === "word"` 且字幕条带 `words[]`）
+ * 才点亮 word 高亮；v3 行级 / v2 镜级 字幕仍按原样展示，整条字幕命中时也会有 sky 背景。
+ */
+function VoiceArtifact({
+  out,
+  narrationUrl,
+  subtitles,
+}: {
+  out: Record<string, unknown>;
+  narrationUrl: string | null;
+  subtitles: Array<Record<string, unknown>> | null;
+}) {
+  const charCount =
+    typeof out.char_count === "number" ? (out.char_count as number) : null;
+  const totalDur =
+    typeof out.total_duration_s === "number"
+      ? (out.total_duration_s as number)
+      : null;
+  const audioDur =
+    typeof out.audio_duration_s === "number"
+      ? (out.audio_duration_s as number)
+      : null;
+  const aligned = out.aligned === true;
+  const alignmentSource =
+    typeof out.alignment_source === "string"
+      ? (out.alignment_source as string)
+      : null;
+  const asrProvider =
+    typeof out.asr_provider === "string" ? (out.asr_provider as string) : null;
+  const asrModel =
+    typeof out.asr_model === "string" ? (out.asr_model as string) : null;
+  const asrMs =
+    typeof out.asr_duration_ms === "number"
+      ? (out.asr_duration_ms as number)
+      : null;
+  const asrSegments =
+    typeof out.asr_segments_count === "number"
+      ? (out.asr_segments_count as number)
+      : null;
+  const alignWarning =
+    typeof out.align_warning === "string" ? (out.align_warning as string) : null;
+  // v3 字段
+  const subtitleGranularity =
+    typeof out.subtitle_granularity === "string"
+      ? (out.subtitle_granularity as string)
+      : null;
+  const linesPerShot = Array.isArray(out.subtitle_lines_per_shot)
+    ? (out.subtitle_lines_per_shot as number[])
+    : null;
+  const subtitleMaxChars =
+    typeof out.subtitle_max_chars === "number"
+      ? (out.subtitle_max_chars as number)
+      : null;
+  // v4 字段
+  const alignmentQuality =
+    typeof out.subtitle_alignment_quality === "string"
+      ? (out.subtitle_alignment_quality as string)
+      : null;
+  const asrWordsCount =
+    typeof out.asr_words_count === "number"
+      ? (out.asr_words_count as number)
+      : null;
+
+  // ──────────── Track-26 卡拉 OK 实时高亮 ────────────
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
+  const isWordLevel = subtitleGranularity === "word";
+
+  // 把 outputs_json 的 subtitles 适配成 hook 接受的 SubtitleWithWords 形状（带数值 start/end + words[]）
+  const subtitlesForHook: SubtitleWithWords[] = useMemo(() => {
+    if (!isWordLevel || !subtitles?.length) return [];
+    const acc: SubtitleWithWords[] = [];
+    for (const s of subtitles) {
+      const start = typeof s.start === "number" ? (s.start as number) : null;
+      const end = typeof s.end === "number" ? (s.end as number) : null;
+      if (start == null || end == null) continue;
+      const wordsRaw = Array.isArray(s.words)
+        ? (s.words as Array<{ start: number; end: number; word: string }>)
+        : null;
+      const words: WordTimestamp[] | null = wordsRaw
+        ? wordsRaw
+            .filter(
+              (w) =>
+                typeof w.start === "number" &&
+                typeof w.end === "number" &&
+                typeof w.word === "string",
+            )
+            .map((w) => ({ start: w.start, end: w.end, word: w.word }))
+        : null;
+      acc.push({ start, end, words });
+    }
+    return acc;
+  }, [subtitles, isWordLevel]);
+
+  const { currentSubtitleIndex, currentWordIndex } = useAudioCurrentWord({
+    audioRef,
+    subtitles: subtitlesForHook,
+    enabled: isWordLevel && isPlaying,
+  });
+
+  return (
+    <div className="flex flex-col gap-2 text-xs">
+      {narrationUrl ? (
+        <audio
+          ref={audioRef}
+          src={narrationUrl}
+          controls
+          className="w-full max-w-md"
+          preload="none"
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+          onEnded={() => setIsPlaying(false)}
+        />
+      ) : (
+        <div className="rounded bg-amber-500/10 px-2 py-1 text-amber-500">
+          未生成旁白音频（{(out.warning as string) || "TTS 未启用或失败"}）
+        </div>
+      )}
+      <div className="flex flex-wrap items-center gap-1.5">
+        {aligned ? (
+          <span
+            className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] text-emerald-500"
+            title={
+              alignmentSource === "asr"
+                ? "字幕已按 ASR 真实音频时长重切（v2+）"
+                : alignmentSource === "ffprobe"
+                ? "字幕已按 ffprobe 真实音频时长重切（ASR 缺 duration 时兜底）"
+                : "字幕已对齐真实音频"
+            }
+          >
+            字幕已对齐 ✓ {alignmentSource ? `(${alignmentSource})` : ""}
+          </span>
+        ) : narrationUrl ? (
+          <span
+            className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-500"
+            title={alignWarning ?? "ASR / ffprobe 都未拿到真实时长，回退 v1 按 shots.duration_s 均分"}
+          >
+            字幕未对齐（v1 均分）
+          </span>
+        ) : null}
+        {subtitleGranularity === "word" ? (
+          <span
+            className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-400"
+            title={
+              "字幕粒度：word 级 (v4)。每条字幕的 start/end 用 ASR word timestamp 强对齐；" +
+              "前端可做卡拉 OK 高亮（hover 字幕条看 word 时间轴）" +
+              (asrWordsCount ? `；asr 返 ${asrWordsCount} words` : "")
+            }
+          >
+            word v4{asrWordsCount ? ` · ${asrWordsCount} words` : ""}
+            {linesPerShot ? ` · ${linesPerShot.join("/")}条` : ""}
+          </span>
+        ) : subtitleGranularity === "line" ? (
+          <span
+            className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] text-sky-500"
+            title={
+              "字幕粒度：行级 (v3)。按句号 / 逗号把每镜 narration 切成多条，更符合阅读节奏" +
+              (subtitleMaxChars ? `；上限 ${subtitleMaxChars} 字/条` : "")
+            }
+          >
+            行级 v3{linesPerShot ? ` · ${linesPerShot.join("/")}条` : ""}
+          </span>
+        ) : subtitleGranularity === "shot" ? (
+          <span
+            className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title="字幕粒度：镜头级 (v2)。每镜 narration 太短，没触发行级细切"
+          >
+            镜级 v2
+          </span>
+        ) : subtitleGranularity === "merged" ? (
+          <span
+            className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title="字幕粒度：v1 兜底。ASR/ffprobe 都失败时按 shots.duration_s 均分"
+          >
+            v1 兜底
+          </span>
+        ) : null}
+        {alignmentQuality && alignmentQuality !== subtitleGranularity ? (
+          <span
+            className="rounded bg-muted/40 px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title="对齐精度档位：word > segment > char-ratio > shots-duration"
+          >
+            align: {alignmentQuality}
+          </span>
+        ) : null}
+        {/* Track-26：v4 word-level 字幕场景才显示卡拉 OK 徽标 */}
+        {isWordLevel ? (
+          <span
+            className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-600 dark:text-violet-400"
+            title="点 play 后，当前 word 会按 ASR word timestamp 实时高亮（throttle ≤ 33ms）"
+          >
+            卡拉 OK 实时高亮 ✓
+          </span>
+        ) : null}
+      </div>
+      <div className="text-muted-foreground">
+        voice <code className="font-mono">{(out.voice as string) || "—"}</code>{" "}
+        · model{" "}
+        <code className="font-mono">
+          {(out.voice_model as string) || "—"}
+        </code>
+        {charCount != null ? ` · ${charCount} 字` : ""}
+        {totalDur != null ? ` · 字幕轨 ${totalDur.toFixed(1)}s` : ""}
+        {audioDur != null ? ` · 旁白真长 ${audioDur.toFixed(1)}s` : ""}
+        {totalDur != null && audioDur != null
+          ? ` · 偏差 ${Math.abs(totalDur - audioDur).toFixed(2)}s`
+          : ""}
+      </div>
+      {asrProvider || asrModel ? (
+        <div className="text-[11px] text-muted-foreground">
+          ASR <code className="font-mono">{asrProvider ?? "—"}</code>
+          {asrModel ? (
+            <>
+              {" / "}
+              <code className="font-mono">{asrModel}</code>
+            </>
+          ) : null}
+          {asrMs != null ? ` · ${asrMs}ms` : ""}
+          {asrSegments != null ? ` · ${asrSegments} segments` : ""}
+        </div>
+      ) : null}
+      {alignWarning ? (
+        <div className="rounded bg-amber-500/10 px-2 py-1 text-[11px] text-amber-500">
+          对齐告警：{alignWarning}
+        </div>
+      ) : null}
+      {subtitles?.length ? (
+        <details className="rounded bg-muted/30 p-2" open={isWordLevel}>
+          <summary className="cursor-pointer text-muted-foreground">
+            字幕（{subtitles.length} 条
+            {linesPerShot && linesPerShot.length
+              ? ` · ${linesPerShot.length} 镜`
+              : ""}
+            ）
+          </summary>
+          <ul className="mt-2 flex flex-col gap-1 text-foreground">
+            {subtitles.slice(0, 18).map((s, i) => {
+              const shotIdx =
+                typeof s.shot_index === "number" ? (s.shot_index as number) : null;
+              const wordsRaw = Array.isArray(s.words)
+                ? (s.words as Array<{ start: number; end: number; word: string }>)
+                : [];
+              const isCurrentSub = isWordLevel && i === currentSubtitleIndex;
+              return (
+                <li
+                  key={i}
+                  data-subtitle-index={i}
+                  className={
+                    "flex flex-col gap-0.5 rounded px-1 transition-colors duration-150 " +
+                    (isCurrentSub
+                      ? "bg-sky-500/15 ring-1 ring-sky-400/40 dark:bg-sky-400/10"
+                      : "")
+                  }
+                >
+                  <div className="flex items-baseline gap-1.5">
+                    {shotIdx != null ? (
+                      <span
+                        className="shrink-0 rounded bg-muted/40 px-1 text-[10px] text-muted-foreground"
+                        title={`shot ${shotIdx}`}
+                      >
+                        S{shotIdx}
+                      </span>
+                    ) : null}
+                    <span className="font-mono text-muted-foreground">
+                      {formatTimeRange(s.start, s.end)}
+                    </span>
+                    <span>{(s.text as string) || ""}</span>
+                    {wordsRaw.length ? (
+                      <span
+                        className="ml-auto rounded bg-violet-500/15 px-1 text-[10px] text-violet-600 dark:text-violet-400"
+                        title={`v4 word-level：${wordsRaw.length} 个 word，hover 时间轴看每词起止`}
+                      >
+                        {wordsRaw.length} words
+                      </span>
+                    ) : null}
+                  </div>
+                  {wordsRaw.length ? (
+                    <div
+                      className="ml-2 flex flex-wrap gap-0.5 text-[10px] text-violet-600/80 dark:text-violet-400/80"
+                      title="word-by-word 时间戳；前端可联动 audio 高亮"
+                    >
+                      {wordsRaw.slice(0, 16).map((w, wi) => {
+                        const isCurrentWord =
+                          isCurrentSub && wi === currentWordIndex;
+                        return (
+                          <span
+                            key={wi}
+                            data-word-index={wi}
+                            className={
+                              "rounded border px-1 font-mono transition-colors duration-150 " +
+                              (isCurrentWord
+                                ? "border-violet-500 bg-violet-500 text-white shadow-sm"
+                                : "border-violet-500/20 bg-violet-500/5")
+                            }
+                            title={`${w.start.toFixed(2)}-${w.end.toFixed(2)}s`}
+                          >
+                            {w.word}
+                          </span>
+                        );
+                      })}
+                      {wordsRaw.length > 16 ? (
+                        <span className="text-muted-foreground">
+                          …+{wordsRaw.length - 16}
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </li>
+              );
+            })}
+            {subtitles.length > 18 ? (
+              <li className="text-[11px] text-muted-foreground">
+                …还有 {subtitles.length - 18} 条
+              </li>
+            ) : null}
+          </ul>
+        </details>
+      ) : null}
+    </div>
+  );
 }
 
 function KeyValRow({ label, value }: { label: string; value: string }) {
