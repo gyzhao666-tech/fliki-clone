@@ -5,7 +5,11 @@
 - 队列分级：
   * `interactive`：研究 / 脚本 / 质检（低延迟，便于 user 等审批节点）
   * `media`     ：视频 / 美术 / 配音 / 剪辑（长任务，worker 起 1-2 个并发即可）
-  * `default`   ：tick 调度器与兜底
+  * `default`   ：tick 调度器、publish.execute_plan（Track-03）与兜底
+- Track-03：发布执行 (`publish.execute_plan`) 也走 `default` 队列；YouTube
+  upload 30-60s 比 tick 重，但与媒体生成的 cpu/gpu 资源池无关，混在 default
+  避免单独再维护一组 worker 启动指令。要拆队列时把 task 的 `queue=` 改到
+  独立队列名（例如 `publish`）即可，不需要改路由路径。
 - `task_acks_late=True` + `worker_prefetch_multiplier=1`：长任务挂掉时不丢 ack，避免 step 卡死
 - 默认**不**启用 always_eager；要在 dev 不起 worker 时跑，由路由层的 `schedule_tick` dispatcher
   fallback 到 BackgroundTasks（更可控）
