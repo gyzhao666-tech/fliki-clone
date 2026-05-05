@@ -6,24 +6,26 @@
 - `PUT    /admin/feature-flags/{tenant_id}/{flag_name}` upsert flag value
 - `DELETE /admin/feature-flags/{tenant_id}/{flag_name}` 删除 flag
 
-权限简化（v1）
---------------
-按 backlog 卡片要求：`user.email in ALLOWED_ADMINS`。
-ALLOWED_ADMINS 来源（Track-23 起）：
-1. `Settings.admin_emails`（pydantic-settings 自动从 env `ADMIN_EMAILS`
-   注入，逗号分隔字符串）
-2. 解析后为空 → fallback 内置默认 `demo@example.com`（与 fixtures 里的
-   demo user 一致，方便本地直接测试；生产 env 必须显式覆盖）
+权限（Track-24 RBAC v1）
+------------------------
+admin 判定流程（``rbac.is_admin`` 内部三路径）：
+1. ``team_members.role == 'admin'``（workspace 级；优先）
+2. workspace 缺省 → 遍历用户所有 workspace 命中任一 admin 即可
+3. 都没命中 → fallback ``Settings.admin_emails`` 邮箱白名单
+   （保留 ``demo@example.com`` 兼容 fixtures / dev seed）
 
-迁移说明（Track-23）
--------------------
-原 v1 实现 `os.environ.get("ADMIN_EMAILS", "")` 直读；Track-01 互斥锁解除后
-迁回 `app/config.py::Settings.admin_emails`，让 IDE 提示 / 全量 settings
-列表里有这一项，避免散落在多个 router 自己读 env。
+为什么仍保留 ``_is_admin_email`` 这个本地函数（不删）
+---------------------------------------------------
+- ``/me`` 探测端点、``_require_admin`` 都从 ``rbac.is_admin`` 走，统一入口
+- ``_is_admin_email`` 仍作为「纯邮箱白名单」工具保留，给已有测试 + 兜底场景使用
+  （rbac 模块也内部复述了同样的逻辑，互为冗余的 fallback）
+- Track-23 已把 ``Settings.admin_emails`` 落库；本 Track 在其上加 RBAC 主路径
 
-为什么不引入完整 RBAC：
-- v1 只需要"关掉灰度按钮的 self-serve 入口"
-- 完整 RBAC 是 L-05 / Track-24 长尾任务（workspace member editor/viewer）
+迁移说明（Track-23 → Track-24）
+-------------------------------
+- Track-23 把 ``ADMIN_EMAILS`` 从 env 直读迁回 ``Settings.admin_emails``
+- Track-24 把 admin 判定主路径从「邮箱白名单」升级为「team_members.role」
+  邮箱白名单作为 fallback 兜底（不删 ``_is_admin_email``）
 
 为什么 tenant_id 是路径参数：
 - admin 操作的对象本来就是「某 tenant 的某 flag」，URL 自描述
@@ -40,6 +42,7 @@ from sqlalchemy import create_engine, text
 
 from app.config import get_settings
 from app.deps import CurrentUser
+from app.services.auth import rbac
 from app.services.pipeline import feature_flags as flag_service
 
 logger = logging.getLogger(__name__)
@@ -68,16 +71,40 @@ def _allowed_admins() -> set[str]:
 
 
 def _is_admin_email(email: Optional[str]) -> bool:
-    """无副作用的 admin 判定；同时给 `_require_admin` 与 `/me` 探测端点用。"""
+    """纯邮箱白名单判定（保留作为 ``rbac.is_admin`` 的 fallback 工具）。
+
+    Track-24 起，admin 主入口走 ``rbac.is_admin``（先查 team_members.role，
+    再 fallback 邮箱白名单）；本函数仍被 ``rbac`` 模块内部复述 + 测试直接调
+    用，作为兜底兼容保留（不删除）。
+    """
     return bool(email) and email.lower() in _allowed_admins()
 
 
+def _is_admin_user(current_user: CurrentUser) -> bool:
+    """统一的 admin 判定入口；从 ``current_user`` 抽 id + email 喂给 rbac。
+
+    单独抽 helper 是为了让 `_require_admin` / `/me` 端点共享同一份判定逻辑，
+    避免两处 if 分支漂移。
+    """
+    return rbac.is_admin(
+        current_user.id,
+        email=current_user.email,
+    )
+
+
 def _require_admin(current_user: CurrentUser) -> None:
-    """简化版 admin gate：user.email 必须命中白名单。"""
-    if not _is_admin_email(current_user.email):
+    """admin gate（Track-24 RBAC v1）。
+
+    判定主路径：``team_members.role == 'admin'``；
+    邮箱白名单作为 fallback 兜底（保留 demo@example.com 兼容）。
+    """
+    if not _is_admin_user(current_user):
         raise HTTPException(
             status_code=403,
-            detail="admin only; ask coordinator to add your email to ADMIN_EMAILS",
+            detail=(
+                "admin only; ask coordinator to add you as workspace admin "
+                "or to ADMIN_EMAILS"
+            ),
         )
 
 
@@ -147,7 +174,7 @@ async def admin_self_check(current_user: CurrentUser) -> AdminMeOut:
        （非 admin 不会拉 `/tenants` 列表，避免一进 app 就触发 403 噪音）
     """
     return AdminMeOut(
-        is_admin=_is_admin_email(current_user.email),
+        is_admin=_is_admin_user(current_user),
         email=current_user.email,
     )
 

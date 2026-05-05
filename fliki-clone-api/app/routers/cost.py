@@ -22,9 +22,13 @@
 Security：
 - `?tenant_id=` 只允许两类调用方提供：
   1. 调用方本人的 tenant_id（被 resolver 推导出的） → 直通
-  2. admin（邮箱白名单命中） → 直通
+  2. admin（``rbac.is_admin`` 命中：先查 team_members.role，邮箱白名单兜底） → 直通
   其余情况强制覆盖回 user 自己的 tenant_id（不抛 403，避免破坏原本是 admin
   从前端抛参数的体验）。
+
+Track-24 起，admin 判定从「邮箱白名单」升级为「``team_members.role`` + 邮箱白名单
+fallback」；本路由只换判定函数（``_is_admin_email`` → ``rbac.is_admin``），URL /
+返回 schema 完全不变。
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ from sqlalchemy import create_engine, text
 
 from app.config import get_settings
 from app.deps import CurrentUser
-from app.routers.admin_flags import _is_admin_email
+from app.services.auth import rbac
 from app.services.pipeline import tenant as pipeline_tenant
 
 
@@ -106,7 +110,7 @@ def _resolve_query_tenant(
         return own
     if request_tenant_id == own:
         return own
-    if _is_admin_email(current_user.email):
+    if rbac.is_admin(current_user.id, email=current_user.email):
         return request_tenant_id
     return own
 
