@@ -1,4 +1,4 @@
-"""ArtAgent v3 / v4 — 风格 + 关键帧 + 角色一致性 + IP-Adapter 真接入
+"""ArtAgent v3 / v4 / v5 — 风格 + 关键帧 + 角色一致性 + IP-Adapter + 多角色锁定
 
 输入：上游 ScriptAgent 的 outputs（topic / script / shots）+ Brief 中的可选视觉偏好
 输出：
@@ -9,7 +9,10 @@
 - `shots`：在 ScriptAgent shots 上叠加 `enhanced_prompt` / `negative_prompt` / `style_ref`
   / `keyframe_url`（v2：调 GENERATE_IMAGE 的产物，作为 IMAGE_TO_VIDEO 的参考帧）
   / `character_locked`（v3：该镜是否真把角色描述拼到 prompt 前缀）
-  / `ip_adapter_used`（v4：该镜出关键帧时是否真把锚点参考图喂给了 image provider）
+  / `locked_character`（v5：该镜被锁定的角色名；VideoAgent 据此选对应 anchor）
+  / `ip_adapter_used`（v4：该镜出关键帧时是否真把对应锚点参考图喂给了 image provider）
+- `character_anchors`（v5 新）：`dict[character_name, anchor_dict]`，每个被锁定的
+  character_card 各一份；`character_anchor` 单字段保留为主角的，向后兼容
 
 v3 角色一致性策略
 -----------------
@@ -49,6 +52,29 @@ v3 已生成 `outputs.character_anchor.url`，但只是放着没真喂回 image 
 
 激活方式：env `SILICONFLOW_KOLORS_IP_MODEL=<官方上线后的 model id>` 把 IP 模型
 路由到主选；缺省时仍尝试给现有 Kolors / FLUX 模型塞 image_url，由 provider 自决降级。
+
+v5 多角色锁定（Track-09，本次新增，在 v3 + v4 之上）
+----------------------------------------------------
+v3/v4 只锁主角：所有镜（focus 默认主角）共用同一份 anchor + 同一段 prompt 前缀。
+但脚本里如果有多个角色（主角 / 配角 / 反派），LLM 在某些镜会显式标
+`focus_character`，那一镜画面焦点是配角而不是主角，这时：
+
+- v3 行为：focus_character != protagonist → `character_locked=False`，prompt 不
+  注入，配角脸跨镜也漂。
+- v5 行为：**给 character_cards 里出现且被任何镜 focus 到的角色（含主角）各出一张
+  锚点参考板**，存到 `outputs.character_anchors[name]`；逐镜根据
+  `shot.focus_character` 找到对应角色卡，注入**该角色的**一致性前缀
+  + 标 `locked_character=name`；VideoAgent 据此选对应 anchor 作 i2v 主参考帧。
+
+一致性 mode 由「至少一个角色出锚点」共同决定：任何角色锚点成功 → mode=anchor；
+全部失败但有角色卡 → mode=prompt-only + warning；无角色卡 → disabled。
+
+outputs 兼容：保留 `character_anchor` 单字段（=主角的 anchor）让 v3/v4 旧消费方
+（VideoAgent v2 旧路径 / 前端 v3 徽标）继续工作；新增 `character_anchors: dict[name,
+anchor]` 给 v5 多角色消费方使用。
+
+成本：每多一个角色多 1 张 GENERATE_IMAGE（≈$0.005）。脚本只用主角时，
+`_select_relevant_characters` 只挑主角，行为与 v4 完全一致（不浪费图）。
 
 设计取舍（v2 沿用）：
 - 默认为每镜出 1 张关键帧（约 $0.005/张，6 镜 ≈ $0.03，远小于视频生成成本）
@@ -130,12 +156,24 @@ class ArtAgent(Step):
         script_out = ctx.upstream_outputs.get("script") or {}
         shots = script_out.get("shots") or []
         brief = (ctx.inputs or {}).get("brief") or {}
-        # 1 次 LLM 提示词增强 + 每镜一张关键帧（默认开启）+ v3 角色锚点 1 张
+        # 1 次 LLM 提示词增强 + 每镜一张关键帧（默认开启）+ v5 多角色锚点 N 张
         skip = bool(brief.get("skip_keyframes"))
         keyframe_cost = 0.0 if skip else 0.005 * len(shots)
-        # 锚点：mode != off 且不是显式 prompt-only 时多算 1 张图
+        # 锚点：mode != off 且不是显式 prompt-only 时按角色数估
         mode = str(brief.get("character_consistency") or DEFAULT_CONSISTENCY_MODE).lower()
-        anchor_cost = 0.005 if mode in ("auto", "anchor") and not skip else 0.0
+        if mode in ("auto", "anchor") and not skip:
+            # script step 还没跑出 character_cards，按 distinct focus_character 数量估
+            distinct_focuses = {
+                str(s.get("focus_character") or "").strip().lower()
+                for s in shots
+                if isinstance(s, dict) and s.get("focus_character")
+            }
+            distinct_focuses.discard("")
+            # 主角 1 张 + 出现的非主角配角各 1 张；上限 5 防 estimate 爆炸
+            anchor_count = 1 + min(len(distinct_focuses), 4)
+            anchor_cost = 0.005 * anchor_count
+        else:
+            anchor_cost = 0.0
         return 0.003 + keyframe_cost + anchor_cost
 
     def run(self, ctx: PipelineContext) -> StepResult:  # noqa: D401
@@ -201,62 +239,106 @@ class ArtAgent(Step):
         total_cost = float(result.cost_usd or 0.0)
         keyframe_failures = 0
 
-        # ── v3：决定一致性模式 + 选主角 + （可选）出锚点 ──────────────────
+        # ── v3 / v5：决定一致性模式 + 选主角 + 选所有相关角色 + 各自出锚点 ─
         consistency_mode = _resolve_consistency_mode(brief, character_cards)
         protagonist = _select_protagonist(brief, character_cards)
-        character_anchor: dict[str, Any] | None = None
+
+        # v5：根据 LLM 标的 focus_character 收集本片真正会被锁定的角色（含主角）
+        relevant_characters = _select_relevant_characters(
+            character_cards=character_cards,
+            shots=enriched_shots,
+        )
+
+        character_anchors: dict[str, dict[str, Any]] = {}
         anchor_warning: str | None = None
 
-        if consistency_mode in ("auto", "anchor") and protagonist:
+        if consistency_mode in ("auto", "anchor") and relevant_characters:
             anchor_aspect = "1:1"  # 锚点参考板用 1:1，便于复用 / IP-Adapter 友好
-            anchor_result = _generate_character_anchor(
-                protagonist=protagonist,
+            character_anchors, anchors_cost = _generate_character_anchors(
+                characters=relevant_characters,
                 style_board=style_board,
                 ctx=ctx,
                 gateway=gateway,
                 aspect=anchor_aspect,
             )
-            total_cost += float(anchor_result.get("cost_usd") or 0.0)
-            character_anchor = anchor_result
-            if not anchor_result.get("url"):
+            total_cost += anchors_cost
+            # 任何一个 anchor 成功就算 mode=anchor；全失败 → 退到 prompt-only
+            any_anchor_ok = any(
+                isinstance(a.get("url"), str) and a["url"]
+                for a in character_anchors.values()
+            )
+            if not any_anchor_ok:
+                # 收集失败原因（取主角的 error 作主消息，其它简略）
+                proto_name = protagonist.get("name") if protagonist else None
+                proto_anchor = (
+                    character_anchors.get(proto_name) if proto_name else None
+                )
+                err_msg = (
+                    proto_anchor.get("error")
+                    if proto_anchor and proto_anchor.get("error")
+                    else next(
+                        (
+                            a.get("error")
+                            for a in character_anchors.values()
+                            if a.get("error")
+                        ),
+                        "unknown",
+                    )
+                )
                 if consistency_mode == "anchor":
                     anchor_warning = (
                         "character_anchor failed; downgraded to prompt-only mode: "
-                        + str(anchor_result.get("error") or "unknown")
+                        + str(err_msg)
                     )[:300]
-                # 锚点失败：mode=auto 时静默降到 prompt-only；mode=anchor 时也降级 + warning
+                # 锚点全挂：mode=auto 时静默降到 prompt-only；mode=anchor 时也降级 + warning
                 consistency_mode = "prompt-only" if character_cards else "disabled"
 
-        # ── v3：把角色描述注入每镜 enhanced_prompt + 防漂 negative ─────────
+        # ── v3 / v5：把角色描述按 focus_character 注入每镜 ────────────────
+        characters_by_name = {
+            str(c.get("name") or "").strip(): c
+            for c in character_cards
+            if c.get("name")
+        }
         if consistency_mode in ("auto", "anchor", "prompt-only") and protagonist:
             enriched_shots = _inject_consistency_into_shots(
-                shots=enriched_shots, protagonist=protagonist
+                shots=enriched_shots,
+                protagonist=protagonist,
+                characters_by_name=characters_by_name,
             )
-            # auto + 锚点成功 → mode 提升为 anchor；auto + 无锚点 → prompt-only
+            # auto + 任一 anchor 成功 → mode 提升为 anchor；auto + 无 anchor → prompt-only
             if consistency_mode == "auto":
-                consistency_mode = (
-                    "anchor"
-                    if character_anchor and character_anchor.get("url")
-                    else "prompt-only"
+                any_anchor_ok = any(
+                    isinstance(a.get("url"), str) and a["url"]
+                    for a in character_anchors.values()
                 )
+                consistency_mode = "anchor" if any_anchor_ok else "prompt-only"
         elif consistency_mode == "auto":
             # auto 但没角色卡 → 真正退回 disabled
             consistency_mode = "disabled"
 
         skip_keyframes = bool(brief.get("skip_keyframes"))
-        # v4：把锚点 URL 喂给 _generate_keyframes，主角镜的关键帧将真用 IP-Adapter
-        anchor_url_for_keyframes: str | None = None
-        if character_anchor and isinstance(character_anchor.get("url"), str):
-            anchor_url_for_keyframes = character_anchor["url"]
+        # v4 / v5：把每角色 anchor URL 喂给 _generate_keyframes，按 shot.locked_character 选
+        anchors_url_by_role: dict[str, str] = {
+            name: a["url"]
+            for name, a in character_anchors.items()
+            if isinstance(a.get("url"), str) and a["url"]
+        }
         if not skip_keyframes:
             enriched_shots, kf_cost, keyframe_failures = _generate_keyframes(
                 enriched_shots,
                 style_board=style_board,
                 ctx=ctx,
                 gateway=gateway,
-                character_anchor_url=anchor_url_for_keyframes,
+                anchors_by_role=anchors_url_by_role,
             )
             total_cost += kf_cost
+
+        # v3 兼容：character_anchor 单字段始终给主角的（向后兼容前端 / 旧 video.py）
+        protagonist_anchor: dict[str, Any] | None = None
+        if protagonist:
+            protagonist_anchor = character_anchors.get(
+                str(protagonist.get("name") or "").strip()
+            )
 
         outputs: dict[str, Any] = {
             "style_board": style_board,
@@ -264,10 +346,12 @@ class ArtAgent(Step):
             "shots": enriched_shots,
             "keyframes_enabled": not skip_keyframes,
             "keyframe_failures": keyframe_failures,
-            # v3 字段
+            # v3 字段（向后兼容）
             "consistency_mode": consistency_mode,
-            "character_anchor": character_anchor,
+            "character_anchor": protagonist_anchor,
             "protagonist_name": protagonist.get("name") if protagonist else None,
+            # v5 新字段：所有锁定角色的 anchor 字典（含主角）
+            "character_anchors": character_anchors or None,
         }
         if anchor_warning:
             outputs["consistency_warning"] = anchor_warning
@@ -287,18 +371,20 @@ def _generate_keyframes(
     style_board: dict[str, Any],
     ctx: PipelineContext,
     gateway: Any,
-    character_anchor_url: str | None = None,
+    anchors_by_role: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], float, int]:
     """为每个 shot 调一次 GENERATE_IMAGE，写入 shots[i].keyframe_url。
 
-    v4：当 `character_anchor_url` 提供且本镜 `character_locked=True` 时，把它作为
-    `image_url` 传入 RenderRequest.params，让 image provider 走 IP-Adapter 路径
-    锁定主角脸。每镜在 outputs 里加：
+    v4 / v5：当本镜 `character_locked=True` 时，**按 `shot.locked_character` 在
+    `anchors_by_role` 里查对应角色的 anchor URL**，传入 `image_url`，让 image
+    provider 走 IP-Adapter 路径锁定该角色脸 / 服装。每镜在 outputs 里加：
 
     - `ip_adapter_used: bool`         provider 写回（True 表 image_url 真喂上去了）
     - `ip_adapter_degrade_reason: str | None`  provider 剥离 image_url 时填这里
 
-    非主角镜（character_locked=False）不传 image_url，避免污染聚焦角色脸。
+    非锁定镜（character_locked=False）不传 image_url，避免主角 anchor 污染配角镜。
+    `anchors_by_role` 缺该角色（锚点失败 / 未生成）时本镜降到 v3 prompt-only 路径，
+    keyframe 仍正常生成只是没 IP 引导。
 
     单镜失败（含 IP-Adapter 不支持后的 v3 兜底降级）仅记 warning + 留 keyframe_error
     字段；不影响其它镜与下游回退路径。返回 (shots, total_cost, failure_count)。
@@ -307,6 +393,9 @@ def _generate_keyframes(
     aspect = str(style_board.get("aspect_ratio") or "16:9")
     total_cost = 0.0
     failures = 0
+    anchors = anchors_by_role or {}
+    # 大小写不敏感的查找 map
+    anchors_lower = {k.lower(): v for k, v in anchors.items()}
 
     out: list[dict[str, Any]] = []
     for shot in shots:
@@ -320,11 +409,18 @@ def _generate_keyframes(
             out.append(merged)
             continue
 
-        # v4：只对「锁了主角」的镜传 anchor 作为 IP-Adapter 输入
-        is_protagonist_shot = bool(shot.get("character_locked"))
-        ref_image_url = (
-            character_anchor_url if (is_protagonist_shot and character_anchor_url) else None
-        )
+        # v5：按 shot.locked_character 选对应角色的 anchor URL
+        locked = bool(shot.get("character_locked"))
+        locked_name = str(shot.get("locked_character") or "").strip()
+        ref_image_url: str | None = None
+        if locked and anchors:
+            if locked_name and locked_name in anchors:
+                ref_image_url = anchors[locked_name]
+            elif locked_name and locked_name.lower() in anchors_lower:
+                ref_image_url = anchors_lower[locked_name.lower()]
+            elif not locked_name:
+                # 没标 locked_character（旧数据）→ 兜底取第一个 anchor，保持 v4 行为
+                ref_image_url = next(iter(anchors.values()))
 
         params: dict[str, Any] = {
             "prompt": prompt,
@@ -494,20 +590,17 @@ def _generate_character_anchor(
     return out
 
 
-def _inject_consistency_into_shots(
-    *,
-    shots: list[dict[str, Any]],
-    protagonist: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """把 protagonist 的 appearance/wardrobe/vibe 拼成稳定前缀，注入到每镜 enhanced_prompt 头。
+def _build_character_prefix(character: dict[str, Any]) -> str:
+    """把单个角色卡的 appearance/wardrobe/vibe 拼成 `[Consistent character: ...]` 前缀。
 
-    标记 `character_locked=true` 让前端 / 调试可观察哪些镜真正注入了一致性 prompt。
-    negative_prompt 追加防漂关键词，避免模型擅自换人。
+    格式与 v3 一致（`protagonist=<name>`），便于跨调用复现 + LLM 训练数据风格统一；
+    v5 给配角注入时也复用这个 key（语义上是「该镜画面的主体角色」），prompt 末尾
+    跟一个空格让用户原 prompt 自然续上。
     """
-    name = str(protagonist.get("name") or "protagonist")
-    appearance = str(protagonist.get("appearance") or "").strip()
-    wardrobe = str(protagonist.get("wardrobe") or "").strip()
-    vibe = str(protagonist.get("vibe") or "").strip()
+    name = str(character.get("name") or "protagonist")
+    appearance = str(character.get("appearance") or "").strip()
+    wardrobe = str(character.get("wardrobe") or "").strip()
+    vibe = str(character.get("vibe") or "").strip()
     body_parts = [
         f"protagonist={name}",
         appearance,
@@ -515,25 +608,71 @@ def _inject_consistency_into_shots(
         f"vibe={vibe}" if vibe else "",
     ]
     body = "; ".join(p for p in body_parts if p)
-    prefix = _CHAR_PROMPT_PREFIX.format(body=body)
+    return _CHAR_PROMPT_PREFIX.format(body=body)
+
+
+def _inject_consistency_into_shots(
+    *,
+    shots: list[dict[str, Any]],
+    protagonist: dict[str, Any],
+    characters_by_name: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """把角色描述按 focus_character 选对应角色的卡，注入到每镜 enhanced_prompt 头。
+
+    v3 行为（characters_by_name 为空 / 只含主角）：focus_character != 主角 → 该镜
+    `character_locked=False` 不注入；focus_character == 主角 / 缺省 → 注入主角前缀。
+
+    v5 行为（characters_by_name 含多个角色）：每镜按 focus_character 在
+    characters_by_name 里找匹配卡（大小写不敏感）：
+    - 命中 → 注入该角色前缀 + `character_locked=True` + `locked_character=<name>`
+    - 未命中（焦点是个没角色卡的代号）→ `character_locked=False`，不注入
+    - 缺省 focus_character → 默认主角
+
+    标记 `character_locked` / `locked_character` 让前端 / VideoAgent 可观察哪个角色
+    被锁定（VideoAgent 据此选对应 anchor 作 i2v ref-image）。negative_prompt 追加
+    防漂关键词，避免模型擅自换人。
+    """
+    proto_name = str(protagonist.get("name") or "protagonist")
+    proto_name_lower = proto_name.lower()
+
+    # 大小写不敏感的角色卡查找（v5 多角色）
+    by_name_lower: dict[str, dict[str, Any]] = {}
+    if characters_by_name:
+        for nm, card in characters_by_name.items():
+            key = str(nm or "").strip().lower()
+            if key:
+                by_name_lower[key] = card
+    # 确保主角在表里（即使 caller 没传 characters_by_name）
+    by_name_lower.setdefault(proto_name_lower, protagonist)
 
     out: list[dict[str, Any]] = []
     for shot in shots:
         merged = dict(shot)
-        # focus_character 显式标了别人 → 跳过该镜（只锁主角，不强加到非主角镜）
-        focus = str(shot.get("focus_character") or "").strip().lower()
-        focus_is_protagonist = (not focus) or (focus == name.lower())
-        if not focus_is_protagonist:
+        focus = str(shot.get("focus_character") or "").strip()
+        focus_lower = focus.lower()
+
+        # 1) 决定要锁定的角色卡
+        if not focus or focus_lower == proto_name_lower:
+            char = protagonist  # 缺省 / 显式主角
+        elif focus_lower in by_name_lower:
+            char = by_name_lower[focus_lower]  # v5：命中其它角色卡
+        else:
+            # focus 标了一个没角色卡的代号 → 不注入（v3 行为兜底）
             merged["character_locked"] = False
             out.append(merged)
             continue
+
+        char_name = str(char.get("name") or proto_name)
 
         original = str(merged.get("enhanced_prompt") or "").strip()
         # 已经包含相同前缀（重跑场景）就不重复注入
         if original.startswith("[Consistent character:"):
             merged["character_locked"] = True
+            merged["locked_character"] = char_name
             out.append(merged)
             continue
+
+        prefix = _build_character_prefix(char)
         merged["enhanced_prompt"] = (prefix + original)[:1200]
 
         # negative：追加防漂关键词，去重避免重叠
@@ -542,8 +681,77 @@ def _inject_consistency_into_shots(
             sep = ", " if neg else ""
             merged["negative_prompt"] = (neg + sep + _CHAR_NEGATIVE_HINT)[:600]
         merged["character_locked"] = True
+        merged["locked_character"] = char_name
         out.append(merged)
     return out
+
+
+def _select_relevant_characters(
+    *,
+    character_cards: list[dict[str, Any]],
+    shots: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """从 character_cards 里挑出本片真正会被锁定的角色（含主角）。
+
+    Track-09 v5：
+    - 主角（cards[0]）始终保留 —— 即使没镜显式 focus 主角，缺省镜也算主角，要 anchor
+    - 其它角色：只有当至少一个 shot 的 `focus_character` 命中其 name（大小写不敏感）
+      时才生成 anchor，避免每片都把全部 cards 都跑一份图浪费成本
+
+    返回的列表保持 character_cards 顺序（主角第一位）。脚本只用主角时返回 1 个，
+    与 v3/v4 完全一致；多角色脚本才会出多于 1 个。
+    """
+    if not character_cards:
+        return []
+    relevant: list[dict[str, Any]] = [character_cards[0]]
+    referenced: set[str] = set()
+    for shot in shots:
+        if not isinstance(shot, dict):
+            continue
+        focus = str(shot.get("focus_character") or "").strip().lower()
+        if focus:
+            referenced.add(focus)
+    proto_name_lower = str(character_cards[0].get("name") or "").strip().lower()
+    referenced.discard(proto_name_lower)
+    referenced.discard("")
+    for card in character_cards[1:]:
+        nm = str(card.get("name") or "").strip().lower()
+        if nm and nm in referenced:
+            relevant.append(card)
+    return relevant
+
+
+def _generate_character_anchors(
+    *,
+    characters: list[dict[str, Any]],
+    style_board: dict[str, Any],
+    ctx: PipelineContext,
+    gateway: Any,
+    aspect: str,
+) -> tuple[dict[str, dict[str, Any]], float]:
+    """为每个角色单独出一张锚点参考图，返回 ({name: anchor_dict}, 累计成本)。
+
+    每个 anchor 与 v3 单角色版本字段一致：{name, appearance, wardrobe, vibe, prompt,
+    aspect, url, provider, model, error, cost_usd}。单个失败仅记 error，不影响其它
+    角色 anchor 与后续流程；caller 决定 mode 是否降级。
+
+    Track-09 v5 之前只调一次（仅主角）；v5 一次会调 N 次（N=relevant characters 数）。
+    """
+    anchors: dict[str, dict[str, Any]] = {}
+    total_cost = 0.0
+    for char in characters:
+        anchor = _generate_character_anchor(
+            protagonist=char,
+            style_board=style_board,
+            ctx=ctx,
+            gateway=gateway,
+            aspect=aspect,
+        )
+        total_cost += float(anchor.get("cost_usd") or 0.0)
+        name = str(char.get("name") or "").strip()
+        if name:
+            anchors[name] = anchor
+    return anchors, total_cost
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
