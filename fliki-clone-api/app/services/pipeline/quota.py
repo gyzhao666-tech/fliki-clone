@@ -493,6 +493,110 @@ def count_active_runs_tenant(tenant_id: str) -> int:
         return int(row[0] or 0) if row else 0
 
 
+def update_tenant_plan(
+    tenant_id: str,
+    new_plan: str,
+    *,
+    display_name: Optional[str] = None,
+) -> TenantQuotaSnapshot:
+    """订阅升级 / 续费 / 降级 时把 tenant 的 plan 切换到 new_plan，并按需 bump 桶。
+
+    Track-11 用：Stripe webhook 收到 checkout.session.completed /
+    customer.subscription.updated 后调一次。
+
+    语义（升级安全 / 降级保护已手调过的桶）：
+    1. tenant_quotas.plan = new_plan（无条件覆盖；plan 列就是「当前订阅档」的事实）
+    2. monthly_limit_usd / concurrent_max：按 PLAN_DEFAULTS 取**新 plan 默认值**；
+       但只在 `desired > current` 时上调（升级 bump），降级时**保留**当前值
+       —— 用户可能花钱续 standard 后人手把月额改高了，降回 free 不应该突然砍掉
+    3. provider_concurrency_buckets：遍历该 tenant 已存在的桶，调
+       `provider_buckets.ensure_bucket(plan=new_plan)`；同样升级 bump、降级保留
+
+    匿名 tenant（anon:）/ 不存在的 tenant 直接 `get_or_create_tenant` 兜底，避免
+    webhook 落到一个还没初始化的租户身上。
+
+    返回最新的 TenantQuotaSnapshot；调用方可写日志 / 返给前端展示。
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+
+    # 局部 import 避免循环：tenant.py 依赖 quota.py，provider_buckets 也依赖 quota
+    from .tenant import plan_defaults
+    from . import provider_buckets
+
+    snap = get_or_create_tenant(tenant_id, plan=new_plan, display_name=display_name)
+
+    if tenant_id.startswith("anon:"):
+        snap.plan = new_plan
+        return snap
+
+    defaults = plan_defaults(new_plan)
+    desired_limit = float(defaults["monthly_limit_usd"])
+    desired_concurrent = int(defaults["concurrent_max"])
+
+    new_limit = max(desired_limit, snap.monthly_limit_usd)
+    new_concurrent = max(desired_concurrent, snap.concurrent_max)
+
+    engine = _engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE tenant_quotas
+                   SET plan = :plan,
+                       monthly_limit_usd = :limit,
+                       concurrent_max = :cmax,
+                       updated_at = NOW()
+                 WHERE tenant_id = :tid
+                """
+            ),
+            {
+                "tid": tenant_id,
+                "plan": new_plan,
+                "limit": new_limit,
+                "cmax": new_concurrent,
+            },
+        )
+
+        rows = conn.execute(
+            text(
+                "SELECT provider_name FROM provider_concurrency_buckets WHERE tenant_id = :tid"
+            ),
+            {"tid": tenant_id},
+        ).fetchall()
+        existing_providers = [r[0] for r in rows]
+
+    for provider_name in existing_providers:
+        try:
+            provider_buckets.ensure_bucket(tenant_id, provider_name, plan=new_plan)
+        except Exception:  # pragma: no cover
+            logger.exception(
+                "ensure_bucket bump failed tenant=%s provider=%s plan=%s",
+                tenant_id,
+                provider_name,
+                new_plan,
+            )
+
+    logger.info(
+        "tenant plan updated tenant=%s plan=%s monthly_limit_usd=%s concurrent_max=%s buckets_bumped=%d",
+        tenant_id,
+        new_plan,
+        new_limit,
+        new_concurrent,
+        len(existing_providers),
+    )
+
+    return TenantQuotaSnapshot(
+        tenant_id=tenant_id,
+        plan=new_plan,
+        monthly_limit_usd=new_limit,
+        current_period_usage_usd=snap.current_period_usage_usd,
+        current_period_start=snap.current_period_start,
+        concurrent_max=new_concurrent,
+        display_name=display_name or snap.display_name,
+    )
+
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 

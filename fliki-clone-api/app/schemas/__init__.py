@@ -395,8 +395,10 @@ class BillingPlanOut(BaseModel):
 
 class CheckoutRequest(BaseModel):
     plan: str  # standard|premium
-    success_url: str
-    cancel_url: str
+    # success_url / cancel_url 可选；前端不传时 router 用 settings.frontend_url + /app/billing 兜底，
+    # 让前端调用方更省事（Track-11）。
+    success_url: Optional[str] = None
+    cancel_url: Optional[str] = None
 
 
 class CheckoutResponse(BaseModel):
