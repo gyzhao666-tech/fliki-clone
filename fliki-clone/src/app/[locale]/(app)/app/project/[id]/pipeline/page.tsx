@@ -1260,6 +1260,11 @@ function StepArtifacts({
                     ? (s.keyframe_error as string)
                     : null;
                 const characterLocked = s.character_locked === true;
+                const ipAdapterUsed = s.ip_adapter_used === true;
+                const ipDegradeReason =
+                  typeof s.ip_adapter_degrade_reason === "string"
+                    ? (s.ip_adapter_degrade_reason as string)
+                    : null;
                 return (
                   <div
                     key={i}
@@ -1279,11 +1284,28 @@ function StepArtifacts({
                       </div>
                     )}
                     {characterLocked ? (
-                      <span
-                        className="absolute right-1 top-1 rounded bg-emerald-500/20 px-1 text-[9px] font-mono text-emerald-200 backdrop-blur"
-                        title="v3 角色一致性 prompt 已注入（character_locked=true）"
-                      >
-                        🔒
+                      <span className="absolute right-1 top-1 flex items-center gap-0.5">
+                        <span
+                          className="rounded bg-emerald-500/20 px-1 text-[9px] font-mono text-emerald-200 backdrop-blur"
+                          title="v3 角色一致性 prompt 已注入（character_locked=true）"
+                        >
+                          🔒
+                        </span>
+                        {ipAdapterUsed ? (
+                          <span
+                            className="rounded bg-violet-500/30 px-1 text-[9px] font-mono text-violet-100 backdrop-blur"
+                            title="v4 IP-Adapter 真接入：本镜把 character_anchor 喂给 image provider（ip_adapter_used=true）"
+                          >
+                            IP
+                          </span>
+                        ) : ipDegradeReason ? (
+                          <span
+                            className="rounded bg-amber-500/30 px-1 text-[9px] font-mono text-amber-100 backdrop-blur"
+                            title={`v4 IP-Adapter 降级：${ipDegradeReason}`}
+                          >
+                            IP↓
+                          </span>
+                        ) : null}
                       </span>
                     ) : null}
                     <div className="text-center text-[10px] text-muted-foreground">
@@ -2105,6 +2127,13 @@ function PlanRow({
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // 乐观更新：toggle 真发后立刻更 UI，让 Upload 按钮颜色立刻反映闸门状态，
+  // 等服务器 PATCH 回来再用 onChanged 拉权威值刷一次。
+  const [confirmReal, setConfirmReal] = useState(plan.confirm_real_publish);
+  useEffect(() => {
+    setConfirmReal(plan.confirm_real_publish);
+  }, [plan.confirm_real_publish]);
+
   const handleStatus = useCallback(
     async (status: PublishPlanOut["status"]) => {
       setBusy(true);
@@ -2122,14 +2151,41 @@ function PlanRow({
     },
     [onChanged, plan.id]
   );
+  const handleConfirmRealToggle = useCallback(
+    async (next: boolean) => {
+      // 乐观更新：先反映到本地 state，让按钮颜色 / 提示立刻变
+      setConfirmReal(next);
+      setBusy(true);
+      try {
+        await patchPublishPlan(plan.id, { confirm_real_publish: next });
+        if (next) {
+          feedback.warning(
+            `「真发」已开启（${plan.platform}）：下次 Upload 会真打外部 API`
+          );
+        } else {
+          feedback.info(`「真发」已关闭（${plan.platform}）：回到 mock 路径`);
+        }
+        onChanged();
+      } catch (err) {
+        // 失败回滚
+        setConfirmReal(!next);
+        const message =
+          err instanceof ApiError ? `API ${err.status}` : "网络错误";
+        feedback.error(`改真发开关失败：${message}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [onChanged, plan.id, plan.platform]
+  );
   const handleExecute = useCallback(async () => {
-    if (
-      !window.confirm(
-        `执行发布计划（${plan.platform}）？\n` +
-          `dry-run / bilibili 不会真发；youtube 默认走安全闸门（不真发，除非 plan.meta.confirm_real_publish=true）`
-      )
-    )
-      return;
+    const realPath =
+      confirmReal && plan.platform.toLowerCase() === "youtube";
+    const promptText = realPath
+      ? `⚠️ 真发模式开启，将把 render 真打到 ${plan.platform} 平台（不可撤销）。\n\n确认继续吗？`
+      : `执行发布计划（${plan.platform}）？\n` +
+        `当前为 mock 路径（dry-run / bilibili 不会真发；youtube 安全闸门关闭，回 mock external_id）。`;
+    if (!window.confirm(promptText)) return;
     setBusy(true);
     try {
       const out = await executePublishPlan(plan.id);
@@ -2148,7 +2204,7 @@ function PlanRow({
     } finally {
       setBusy(false);
     }
-  }, [onChanged, plan.id, plan.platform]);
+  }, [confirmReal, onChanged, plan.id, plan.platform]);
   const handleDelete = useCallback(async () => {
     if (!window.confirm(`删除发布计划（${plan.platform}）？`)) return;
     setBusy(true);
@@ -2164,6 +2220,21 @@ function PlanRow({
       setBusy(false);
     }
   }, [onChanged, plan.id, plan.platform]);
+
+  // Upload 按钮颜色：真发开启 = 红色（危险）；关闭 = 绿色（安全 mock）。
+  // 仅 youtube 受真发开关影响；其他平台按钮保持原 ghost 灰色。
+  const isYoutube = plan.platform.toLowerCase() === "youtube";
+  const uploadBtnCls = isYoutube
+    ? confirmReal
+      ? "text-rose-500 hover:text-rose-600 hover:bg-rose-500/10"
+      : "text-emerald-500 hover:text-emerald-600 hover:bg-emerald-500/10"
+    : "";
+  const uploadBtnTitle = isYoutube
+    ? confirmReal
+      ? "⚠ 真发模式：将真打 YouTube Upload API（不可撤销）"
+      : "安全 mock：仅返回假 external_id（开启「真发」后才真打）"
+    : "调用发布执行器：把 render 真推到目标平台（dry-run / bilibili / youtube）";
+
   return (
     <li className="flex flex-col gap-1 rounded border border-border bg-background/40 px-2 py-1.5">
       <div className="flex items-center gap-2">
@@ -2176,9 +2247,19 @@ function PlanRow({
           {plan.status}
         </span>
         <div className="min-w-0 flex-1">
-          <div className="truncate font-medium">
-            {plan.platform}
-            {plan.title ? ` · ${plan.title}` : ""}
+          <div className="flex items-center gap-1.5 truncate font-medium">
+            <span className="truncate">
+              {plan.platform}
+              {plan.title ? ` · ${plan.title}` : ""}
+            </span>
+            {isYoutube && confirmReal ? (
+              <span
+                className="shrink-0 rounded bg-rose-500/15 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-rose-500"
+                title="该 plan 真发闸门已开启"
+              >
+                LIVE
+              </span>
+            ) : null}
           </div>
           <div className="truncate text-[10px] text-muted-foreground">
             {plan.render_id ? `render ${plan.render_id.slice(0, 8)}…` : "无 render"}
@@ -2205,13 +2286,36 @@ function PlanRow({
             </option>
           ))}
         </select>
+        <label
+          className={
+            "flex items-center gap-1 rounded border px-1.5 py-1 text-[10px] cursor-pointer select-none " +
+            (confirmReal
+              ? "border-rose-500/50 bg-rose-500/10 text-rose-500"
+              : "border-border bg-background text-muted-foreground hover:text-foreground")
+          }
+          title={
+            isYoutube
+              ? "勾选后 youtube adapter 会真打 YouTube Upload API；不勾时回 mock external_id"
+              : "「真发」开关只影响 youtube adapter；dry-run / bilibili 不读该字段"
+          }
+        >
+          <input
+            type="checkbox"
+            className="size-3 accent-rose-500"
+            checked={confirmReal}
+            onChange={(e) => handleConfirmRealToggle(e.target.checked)}
+            disabled={busy}
+          />
+          真发
+        </label>
         {plan.status !== "published" ? (
           <Button
             size="sm"
             variant="ghost"
+            className={uploadBtnCls}
             onClick={handleExecute}
             disabled={busy}
-            title="调用发布执行器：把 render 真推到目标平台（dry-run / bilibili / youtube）"
+            title={uploadBtnTitle}
           >
             <Upload className="size-3.5" />
           </Button>
@@ -2287,6 +2391,12 @@ function ShotsSourceBadge({ useShotList }: { useShotList: boolean }) {
 // ── VideoArtifact ───────────────────────────────────────────────────────────
 //   video step 卡片：每镜显示 <video> 缩略图 + provider/model/cost/error。
 //   优先读 shot_list（含 video_url + 同行的 keyframe_url 做 poster）；缺失退到 outputs_json。
+//   v2：每镜右上角额外渲染 <RefImageSourceBadge>：emerald「anchor 锚定」/ sky「keyframe」/
+//   muted「无参考」。ref_image_source 字段只活在 video step.outputs_json.shots[i] 里
+//   （shot_lists 表暂不存这个字段，避免新加 alembic 迁移），所以即使主体走 shot-list 路径，
+//   徽标仍会按 index 从 outputsShots 里 lookup；找不到时按 keyframe_url 推断（best-effort）。
+
+type RefImageSource = "anchor" | "keyframe" | "none";
 
 function VideoArtifact({
   step,
@@ -2299,13 +2409,27 @@ function VideoArtifact({
 }) {
   // 优先用 shot-list（含 art keyframe + video URL 同行）；缺失 fallback 到 outputs_json
   const useShotListSource = !!(shotList && shotList.shots && shotList.shots.length);
+
+  // 按 index 建 outputs lookup，给徽标读 ref_image_source 用（shot_list 路径下 schema 不带）
+  const outputsByIndex = new Map<number, Record<string, unknown>>();
+  outputsShots.forEach((s, i) => {
+    const idx =
+      typeof s.index === "number" ? (s.index as number) : i + 1;
+    outputsByIndex.set(idx, s);
+  });
+
   const rows: Array<VideoShotView> = useShotListSource
-    ? shotList!.shots.map(toViewFromShotList)
+    ? shotList!.shots.map((s) =>
+        toViewFromShotList(s, outputsByIndex.get(s.index)),
+      )
     : outputsShots.map(toViewFromOutputs);
 
   const okCount = rows.filter((r) => r.video_url).length;
   const errCount = rows.filter((r) => r.error).length;
   const totalCost = rows.reduce((acc, r) => acc + (r.cost_usd || 0), 0);
+  const anchorCount = rows.filter((r) => r.ref_image_source === "anchor").length;
+  const keyframeCount = rows.filter((r) => r.ref_image_source === "keyframe").length;
+  const noRefCount = rows.filter((r) => r.ref_image_source === "none").length;
 
   if (!rows.length) {
     return (
@@ -2324,13 +2448,28 @@ function VideoArtifact({
           {errCount ? ` · ${errCount} 失败` : ""}
           {totalCost > 0 ? ` · cost $${totalCost.toFixed(4)}` : ""}
         </span>
+        {anchorCount + keyframeCount + noRefCount > 0 ? (
+          <span
+            className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title="ref-image 来源汇总：anchor=主角镜用全片锚点参考板，keyframe=每镜独立关键帧，none=无 ref（GENERATE_VIDEO 降级）"
+          >
+            ref:{" "}
+            <span className="text-emerald-500">{anchorCount} anchor</span>
+            {" · "}
+            <span className="text-sky-500">{keyframeCount} keyframe</span>
+            {noRefCount ? ` · ${noRefCount} none` : ""}
+          </span>
+        ) : null}
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
         {rows.slice(0, 12).map((r) => (
           <div
             key={r.index}
-            className="flex flex-col gap-1 rounded border border-border bg-muted/20 p-1.5"
+            className="relative flex flex-col gap-1 rounded border border-border bg-muted/20 p-1.5"
           >
+            <div className="absolute right-1 top-1 z-10">
+              <RefImageSourceBadge source={r.ref_image_source} />
+            </div>
             {r.video_url ? (
               <video
                 src={r.video_url}
@@ -2388,6 +2527,42 @@ function VideoArtifact({
   );
 }
 
+// ── ref-image 来源徽标（v2 Track-05）─────────────────────────────────────────
+//   anchor   → emerald「anchor 锚定」（主角镜复用全片锚点参考板，跨镜更稳定）
+//   keyframe → sky「keyframe」（每镜独立关键帧；非主角镜 / character_locked=False）
+//   none     → muted「无参考」（GENERATE_VIDEO 降级路径）
+
+function RefImageSourceBadge({ source }: { source: RefImageSource }) {
+  if (source === "anchor") {
+    return (
+      <span
+        className="rounded bg-emerald-500/85 px-1 py-0.5 text-[9px] font-medium text-emerald-50 shadow-sm"
+        title="ref-image 来源：character_anchor（ArtAgent v3 主角锚点参考板，跨镜复用）"
+      >
+        anchor 锚定
+      </span>
+    );
+  }
+  if (source === "keyframe") {
+    return (
+      <span
+        className="rounded bg-sky-500/85 px-1 py-0.5 text-[9px] font-medium text-sky-50 shadow-sm"
+        title="ref-image 来源：本镜独立 keyframe（非主角镜或 character_locked=false）"
+      >
+        keyframe
+      </span>
+    );
+  }
+  return (
+    <span
+      className="rounded bg-muted px-1 py-0.5 text-[9px] font-medium text-muted-foreground shadow-sm"
+      title="无 ref-image：降级到 GENERATE_VIDEO（无角色一致性引导）"
+    >
+      无参考
+    </span>
+  );
+}
+
 interface VideoShotView {
   index: number;
   video_url: string | null;
@@ -2397,9 +2572,29 @@ interface VideoShotView {
   cost_usd: number;
   duration_ms: number;
   error: string | null;
+  ref_image_source: RefImageSource;
 }
 
-function toViewFromShotList(s: ShotOut): VideoShotView {
+function readRefImageSource(
+  raw: Record<string, unknown> | undefined,
+  fallback: { keyframe_url: string | null },
+): RefImageSource {
+  const v =
+    raw && typeof raw.ref_image_source === "string"
+      ? (raw.ref_image_source as string)
+      : null;
+  if (v === "anchor" || v === "keyframe" || v === "none") {
+    return v;
+  }
+  // outputs_json 还没写 ref_image_source（旧 run / persist 还没触发）→ 按 keyframe 推断
+  // 注：这里推断不到 anchor，只能区分 keyframe / none；准确值由后端写入
+  return fallback.keyframe_url ? "keyframe" : "none";
+}
+
+function toViewFromShotList(
+  s: ShotOut,
+  outputsRow: Record<string, unknown> | undefined,
+): VideoShotView {
   return {
     index: s.index,
     video_url: s.video_url,
@@ -2409,15 +2604,19 @@ function toViewFromShotList(s: ShotOut): VideoShotView {
     cost_usd: s.video_cost_usd,
     duration_ms: s.video_duration_ms,
     error: s.video_error,
+    ref_image_source: readRefImageSource(outputsRow, {
+      keyframe_url: s.keyframe_url,
+    }),
   };
 }
 
 function toViewFromOutputs(s: Record<string, unknown>, i: number): VideoShotView {
+  const keyframe_url =
+    typeof s.keyframe_url === "string" ? (s.keyframe_url as string) : null;
   return {
     index: typeof s.index === "number" ? (s.index as number) : i + 1,
     video_url: typeof s.video_url === "string" ? (s.video_url as string) : null,
-    keyframe_url:
-      typeof s.keyframe_url === "string" ? (s.keyframe_url as string) : null,
+    keyframe_url,
     // outputs_json 用 provider/model/mode（而不是 video_provider）
     provider: typeof s.provider === "string" ? (s.provider as string) : null,
     mode: typeof s.mode === "string" ? (s.mode as string) : null,
@@ -2425,6 +2624,7 @@ function toViewFromOutputs(s: Record<string, unknown>, i: number): VideoShotView
     duration_ms:
       typeof s.duration_ms === "number" ? (s.duration_ms as number) : 0,
     error: typeof s.error === "string" ? (s.error as string) : null,
+    ref_image_source: readRefImageSource(s, { keyframe_url }),
   };
 }
 

@@ -159,6 +159,9 @@ class PublishPlanOut(BaseModel):
     tags: Optional[list[str]] = None
     cover_url: Optional[str] = None
     error: Optional[str] = None
+    # Track-02：真发安全闸门（true 时 youtube adapter 才真打外部 API；
+    # dry-run / bilibili 不看这个字段）
+    confirm_real_publish: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -367,6 +370,8 @@ class PublishPlanPatch(BaseModel):
     cover_url: Optional[str] = None
     render_id: Optional[str] = None
     error: Optional[str] = None
+    # Track-02：真发安全闸门 toggle（前端 PlanRow 上的「真发」checkbox 改这一字段）
+    confirm_real_publish: Optional[bool] = None
 
 
 @router.get("/files/{file_id}/publish-plans", response_model=list[PublishPlanOut])
@@ -379,8 +384,8 @@ async def list_publish_plans(
             text(
                 "SELECT id, file_id, run_id, render_id, platform, status, scheduled_at, "
                 "published_at, external_id, title, description, tags_json, cover_url, error, "
-                "created_at, updated_at FROM publish_plans WHERE file_id = :fid "
-                "ORDER BY created_at DESC"
+                "confirm_real_publish, created_at, updated_at FROM publish_plans "
+                "WHERE file_id = :fid ORDER BY created_at DESC"
             ),
             {"fid": file_id},
         ).fetchall()
@@ -446,6 +451,7 @@ async def patch_publish_plan(
         ("cover_url", "cover_url", body.cover_url),
         ("render_id", "render_id", body.render_id),
         ("error", "error", body.error),
+        ("confirm_real_publish", "confirm_real_publish", body.confirm_real_publish),
     ):
         if val is not None:
             sets.append(f"{col} = :{field}")
@@ -507,7 +513,7 @@ def _load_plan_or_404(plan_id: str) -> PublishPlanOut:
             text(
                 "SELECT id, file_id, run_id, render_id, platform, status, scheduled_at, "
                 "published_at, external_id, title, description, tags_json, cover_url, error, "
-                "created_at, updated_at FROM publish_plans WHERE id = :id"
+                "confirm_real_publish, created_at, updated_at FROM publish_plans WHERE id = :id"
             ),
             {"id": plan_id},
         ).fetchone()
@@ -522,7 +528,8 @@ def _plan_row_to_out(r) -> PublishPlanOut:
         id=r[0], file_id=r[1], run_id=r[2], render_id=r[3], platform=r[4], status=r[5],
         scheduled_at=r[6], published_at=r[7], external_id=r[8], title=r[9],
         description=r[10], tags=tags, cover_url=r[12], error=r[13],
-        created_at=r[14], updated_at=r[15],
+        confirm_real_publish=bool(r[14]),
+        created_at=r[15], updated_at=r[16],
     )
 
 

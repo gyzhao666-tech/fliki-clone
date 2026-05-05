@@ -36,6 +36,9 @@ class PublishRequest:
     credential: Optional[dict[str, Any]] = None
     # 调用方可注入 idempotency_key 防重复发布
     idempotency_key: Optional[str] = None
+    # 安全闸门：默认 False = adapter 走 mock / dry-run；True = adapter 真打外部 API
+    # （Track-02：替代 v1 的 plan.meta_json.confirm_real_publish 隐藏字段）
+    confirm_real_publish: bool = False
 
 
 @dataclass

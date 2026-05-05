@@ -75,8 +75,6 @@ def execute_publish_plan(plan_id: str, *, user_id: str) -> PublishOutcome:
                 ),
             )
         credential_dict = cred.to_adapter_input()
-        # 把 plan.meta 也透传给 adapter（v1 youtube 安全闸门要看 confirm_real_publish）
-        credential_dict["plan_meta"] = plan_row["meta"] or {}
 
     req = PublishRequest(
         plan_id=plan_id,
@@ -95,6 +93,7 @@ def execute_publish_plan(plan_id: str, *, user_id: str) -> PublishOutcome:
         scheduled_at=plan_row["scheduled_at"],
         credential=credential_dict,
         idempotency_key=f"plan:{plan_id}",
+        confirm_real_publish=bool(plan_row["confirm_real_publish"]),
     )
 
     try:
@@ -201,7 +200,7 @@ def _load_plan(plan_id: str) -> Optional[dict[str, Any]]:
                 """
                 SELECT p.id, p.file_id, p.run_id, p.render_id, p.platform, p.status,
                        p.scheduled_at, p.title, p.description, p.tags_json,
-                       p.cover_url, p.meta_json, p.error,
+                       p.cover_url, p.meta_json, p.error, p.confirm_real_publish,
                        f.user_id,
                        r.url, r.aspect_ratio, r.duration_s
                   FROM publish_plans p
@@ -230,10 +229,11 @@ def _load_plan(plan_id: str) -> Optional[dict[str, Any]]:
         "cover_url": row[10],
         "meta": meta,
         "error": row[12],
-        "user_id": row[13],
-        "render_url": row[14],
-        "render_aspect_ratio": row[15],
-        "render_duration_s": float(row[16]) if row[16] is not None else None,
+        "confirm_real_publish": bool(row[13]),
+        "user_id": row[14],
+        "render_url": row[15],
+        "render_aspect_ratio": row[16],
+        "render_duration_s": float(row[17]) if row[17] is not None else None,
     }
 
 

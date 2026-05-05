@@ -8,8 +8,8 @@
 - 缺凭证 / scope 不足时返 `PublishOutcome(ok=False, error=...)`，不抛异常 → executor 写
   `plan.status='failed' + plan.error=...`，前端显示「YouTube 未授权 / scope 不足」
 - 正在跑 v1 时**不真发**，避免误测：把 token 拿到、URL 校验通过即可，但 upload 端点用
-  `dry-run` 模式（返 mock external_id）；用户在 brief / plan.meta 里设 `confirm_real_publish=true`
-  才真发。这是 v1 的安全闸门。
+  `dry-run` 模式（返 mock external_id）；要真发必须 `plan.confirm_real_publish=true`
+  （Track-02 已把这个开关从 `meta_json` 提到独立列；req.confirm_real_publish 由 executor 透传）。
 - 真发的 resumable upload 实现细节（chunked PUT / 续传）留给 v2；v1 走简单 `multipart` 一次发。
 """
 from __future__ import annotations
@@ -101,15 +101,13 @@ class YouTubeAdapter(PlatformAdapter):
                 cred["access_token"] = access_token
                 cred["expires_at"] = refreshed["expires_at"]
 
-        # v1 安全闸门：除非 plan.meta_json.confirm_real_publish=true，否则不真发
-        confirm_real = bool(
-            (cred.get("plan_meta") or {}).get("confirm_real_publish")
-        )
-        if not confirm_real:
+        # 安全闸门（Track-02）：除非 plan.confirm_real_publish=true，否则不真发。
+        # executor 把该列从 publish_plans 直接读出后透传到 req.confirm_real_publish。
+        if not req.confirm_real_publish:
             ext_id = f"youtube-pending-{req.plan_id[:8]}-{int(time.time())}"
             logger.info(
-                "youtube adapter v1 safety gate: not actually uploading "
-                "plan=%s; set plan.meta_json.confirm_real_publish=true to trigger real upload",
+                "youtube adapter safety gate: not actually uploading plan=%s; "
+                "toggle plan.confirm_real_publish=true to trigger real upload",
                 req.plan_id,
             )
             return PublishOutcome(
@@ -120,7 +118,7 @@ class YouTubeAdapter(PlatformAdapter):
                 published_at=datetime.now(tz=timezone.utc),
                 meta={
                     "platform": "youtube",
-                    "safety_gate": "skipped real upload (set plan.meta_json.confirm_real_publish=true to enable)",
+                    "safety_gate": "skipped real upload (toggle plan.confirm_real_publish=true to enable)",
                     "title": req.title,
                     "tags": req.tags,
                 },

@@ -154,6 +154,11 @@ export interface PublishPlanOut {
   tags: string[] | null;
   cover_url: string | null;
   error: string | null;
+  /**
+   * Track-02 真发安全闸门：默认 false = adapter 走 mock 路径；
+   * true = youtube adapter 真打外部 API（dry-run / bilibili adapter 不读这字段）。
+   */
+  confirm_real_publish: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -181,6 +186,8 @@ export interface PatchPublishPlanPayload {
   cover_url?: string;
   render_id?: string;
   error?: string;
+  /** Track-02 真发安全闸门 toggle */
+  confirm_real_publish?: boolean;
 }
 
 export function listFilePublishPlans(fileId: string) {
