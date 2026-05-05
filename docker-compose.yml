@@ -1,0 +1,124 @@
+# Track-28 · 单机 docker compose 部署（5 个服务：postgres + redis + backend + worker + frontend）
+#
+# 设计要点：
+# - postgres / redis 用 alpine 官方镜像 + healthcheck，让 backend / worker 等到 ready 再起，
+#   避免 backend lifespan 跑 `SELECT 1` 时 PG 还没 listen 报 503。
+# - backend / worker 共享同一份 Dockerfile（fliki-clone-api/Dockerfile）；worker 用 `command:`
+#   覆盖默认 CMD，跑 celery worker -Q interactive,media,default --concurrency=2（与 Makefile
+#   pipeline-worker target 完全一致）。生产想拆三个独立 worker（每队列一个）只需复制
+#   worker block 改 -Q 即可。
+# - backend / worker 都从 ./fliki-clone-api/.env 读全部业务 key（SiliconFlow / Kling / OpenAI /
+#   Stripe / SMTP / 凭证 Fernet KEY ...）；compose 里再 environment 显式覆盖三个东西：
+#     DATABASE_URL_SYNC / DATABASE_URL  → postgres:5432（compose 网络服务名）
+#     REDIS_URL / CELERY_BROKER_URL / CELERY_RESULT_BACKEND → redis:6379
+#     CELERY_ENABLED=true（worker 起着了，让 router 走 celery dispatch 而不是 BackgroundTasks）
+#   这样 host 上 .env 仍写 localhost / 127.0.0.1 不变（host 直跑 uvicorn 也能用），
+#   docker 网络里自动指向 service 名，互不打扰。
+# - frontend 通过 `NEXT_PUBLIC_API_URL=http://localhost:8000` 让浏览器（host）打到 backend。
+#   注意：浏览器跑在用户的电脑 host 上，不是容器网络里，所以这里必须是 localhost 而非 `http://backend:8000`。
+# - postgres data 用 named volume `postgres_data`，容器删了 schema 不丢。
+#
+# 启动：在仓库根 `docker compose up -d`；停 `docker compose down`；删数据 `docker compose down -v`。
+# 也提供 fliki-clone-api/Makefile 的 docker-up / docker-down / docker-logs / docker-rebuild target。
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fliki}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fliki}
+      POSTGRES_DB: ${POSTGRES_DB:-fliki}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fliki} -d ${POSTGRES_DB:-fliki}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./fliki-clone-api
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./fliki-clone-api/.env
+    environment:
+      # ── 强制覆盖 host 走 docker 网络服务名 ──────────────────────────
+      # .env 里的 DATABASE_URL_SYNC=postgresql://...@localhost:5432/fliki 只对 host 直跑有效；
+      # 容器内 localhost 是容器自己，必须改走 service 名 postgres:5432。
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-fliki}:${POSTGRES_PASSWORD:-fliki}@postgres:5432/${POSTGRES_DB:-fliki}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fliki}:${POSTGRES_PASSWORD:-fliki}@postgres:5432/${POSTGRES_DB:-fliki}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      # 既然 worker 同时起，让 router 走 celery dispatch（dispatch 失败仍 BackgroundTasks 兜底）
+      CELERY_ENABLED: "true"
+      API_PUBLIC_BASE_URL: http://localhost:8000
+      FRONTEND_URL: http://localhost:3000
+    ports:
+      - "8000:8000"
+    healthcheck:
+      # main.py 里有 GET /health 返 200；用 curl 是因为 backend 镜像装了 curl
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ./fliki-clone-api
+      dockerfile: Dockerfile
+    # 与 Makefile::pipeline-worker target 完全一致的命令；三队列单 worker 进程并发 2
+    command: ["celery", "-A", "app.services.pipeline.celery_app", "worker", "-Q", "interactive,media,default", "--concurrency=2", "--loglevel=info"]
+    depends_on:
+      backend:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file:
+      - ./fliki-clone-api/.env
+    environment:
+      DATABASE_URL_SYNC: postgresql://${POSTGRES_USER:-fliki}:${POSTGRES_PASSWORD:-fliki}@postgres:5432/${POSTGRES_DB:-fliki}
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fliki}:${POSTGRES_PASSWORD:-fliki}@postgres:5432/${POSTGRES_DB:-fliki}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/1
+      CELERY_ENABLED: "true"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./fliki-clone
+      dockerfile: Dockerfile
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # 浏览器跑在 host 上 → 必须是 host 视角的 localhost:8000，不是容器视角的 backend:8000
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NODE_ENV: production
+      PORT: "3000"
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+
+volumes:
+  postgres_data:

@@ -1,0 +1,35 @@
+# Track-28 · backend build context 实际生效的 .dockerignore
+.git
+.gitignore
+.cursor
+.vscode
+.idea
+
+# Python
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+coverage
+htmlcov
+*.egg-info
+
+# Env / secrets（千万别把本地 .env 烧进镜像；生产从 docker-compose env_file / k8s secret 注入）
+.env
+.env.*
+!.env.example
+
+# 构建 / 运行时不需要的产物
+static/videos
+var
+node_modules
+
+# 文档（README / NOTES 不进镜像）
+*.md
+
+# 编辑器 / OS
+*.swp
+.DS_Store

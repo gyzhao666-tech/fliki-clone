@@ -75,3 +75,18 @@ test-integration:
 
 test-cov:
 	$(PYTEST) tests/ -v --cov=app --cov-report=html
+
+# ── Docker 单机部署（Track-28）────────────────────────────────
+# 仓库根的 docker-compose.yml 起 5 个服务：postgres + redis + backend + worker + frontend
+# 这些 target 只是 host 上的便捷 wrapper，复杂场景直接 `cd .. && docker compose ...`
+docker-up:
+	cd .. && docker compose up -d
+
+docker-down:
+	cd .. && docker compose down
+
+docker-logs:
+	cd .. && docker compose logs -f --tail=100
+
+docker-rebuild:
+	cd .. && docker compose build --no-cache
