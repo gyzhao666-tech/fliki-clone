@@ -2365,6 +2365,8 @@ function PlanRow({
   const executing = planStream.pending;
   const streamMode = planStream.mode;
   const latestPhase = planStream.latestEvent?.phase ?? null;
+  // Track-13：YouTube chunked PUT 进度（非终态；executing=false 时清空 → 进度条隐藏）
+  const uploadProgress = executing ? planStream.latestProgress : null;
 
   const handleStatus = useCallback(
     async (status: PublishPlanOut["status"]) => {
@@ -2600,6 +2602,7 @@ function PlanRow({
           <Trash2 className="size-3.5" />
         </Button>
       </div>
+      {uploadProgress ? <UploadProgressBar progress={uploadProgress} /> : null}
       {plan.error ? (
         <div className="rounded bg-rose-500/10 px-2 py-1 text-[11px] text-rose-500">
           ⚠ {plan.error}
@@ -2607,6 +2610,66 @@ function PlanRow({
       ) : null}
     </li>
   );
+}
+
+// ── Track-13：YouTube chunked PUT 进度条 ───────────────────────────────────
+//   后端 youtube adapter 改成 8 MiB 分片 PUT 后，每片完成会推一条 upload_progress
+//   SSE 事件（含 percent / bytes_uploaded / total / chunk_index / chunk_count）。
+//   PlanRow 在 executing 期间渲一根细横条 + 文案，让 1080p / 60s+ 大视频上传不再
+//   只显示一个 spinner 干转。下载阶段（phase=downloading）单独标灰，避免用户以为
+//   上传卡住；上传阶段才走 sky 主色。
+function UploadProgressBar({
+  progress,
+}: {
+  progress: NonNullable<
+    ReturnType<typeof usePublishPlanStream>["latestProgress"]
+  >;
+}) {
+  const percent = Math.max(0, Math.min(100, progress.percent ?? 0));
+  const isUploading = progress.phase === "uploading";
+  const phaseLabel = isUploading ? "上传中" : "下载渲染";
+  const chunkLabel =
+    isUploading && progress.chunk_count > 0
+      ? ` · 片 ${progress.chunk_index + 1}/${progress.chunk_count}`
+      : "";
+  const sizeLabel =
+    progress.total > 0
+      ? ` · ${formatBytes(progress.bytes_uploaded)} / ${formatBytes(
+          progress.total
+        )}`
+      : "";
+  const barCls = isUploading ? "bg-sky-500" : "bg-muted-foreground/50";
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center justify-between text-[10px] text-muted-foreground">
+        <span>
+          {phaseLabel}
+          {chunkLabel}
+        </span>
+        <span className="tabular-nums">
+          {percent.toFixed(1)}%{sizeLabel}
+        </span>
+      </div>
+      <div className="h-1.5 overflow-hidden rounded bg-muted/40">
+        <div
+          className={`h-full transition-[width] duration-300 ease-out ${barCls}`}
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+    </div>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
 function planStatusCls(status: PublishPlanOut["status"]) {

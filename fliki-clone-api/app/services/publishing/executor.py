@@ -76,6 +76,11 @@ def execute_publish_plan(plan_id: str, *, user_id: str) -> PublishOutcome:
             )
         credential_dict = cred.to_adapter_input()
 
+    # Track-13：分片上传进度回调；adapter 每完成一片调一次。
+    # cb 把进度落 publish_plans.meta_json.upload_progress + 推 SSE upload_progress
+    # 事件让前端进度条流畅；任一边 fail 都不阻断上传主流程。
+    progress_cb = _make_progress_cb(plan_id)
+
     req = PublishRequest(
         plan_id=plan_id,
         user_id=user_id,
@@ -94,6 +99,7 @@ def execute_publish_plan(plan_id: str, *, user_id: str) -> PublishOutcome:
         credential=credential_dict,
         idempotency_key=f"plan:{plan_id}",
         confirm_real_publish=bool(plan_row["confirm_real_publish"]),
+        progress_cb=progress_cb,
     )
 
     try:
@@ -190,6 +196,60 @@ def _outcome_meta(outcome: PublishOutcome) -> dict[str, Any]:
     if outcome.external_url:
         out["external_url"] = outcome.external_url
     return out
+
+
+# ── Track-13：upload progress write-back + SSE 推送 ─────────────────────────
+
+
+def _make_progress_cb(plan_id: str):
+    """构造一个上传进度回调闭包。
+
+    每次 adapter 完成一片就被调一次：
+    1. read-modify-write `publish_plans.meta_json` 把 ``upload_progress`` 字段
+       merge 进去（meta_json 是 JSON 而非 JSONB，没法用 `||` 直接合并）
+    2. 推一条 SSE ``upload_progress`` 事件到 ``publish:plan:{plan_id}`` 频道
+       让前端 hook 摘到 percent / bytes_uploaded 喂进度条
+
+    任何写库 / 推 SSE 失败都仅记 warning：上传主流程必须不被进度回写挡住。
+    """
+
+    def _cb(info: dict[str, Any]) -> None:
+        try:
+            with _engine().begin() as conn:
+                row = conn.execute(
+                    text("SELECT meta_json FROM publish_plans WHERE id = :id"),
+                    {"id": plan_id},
+                ).fetchone()
+                existing = (row[0] or {}) if row else {}
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing["upload_progress"] = info
+                conn.execute(
+                    text(
+                        "UPDATE publish_plans "
+                        "SET meta_json = CAST(:m AS JSON), updated_at = NOW() "
+                        "WHERE id = :id"
+                    ),
+                    {
+                        "id": plan_id,
+                        "m": json.dumps(existing, ensure_ascii=False, default=str),
+                    },
+                )
+        except Exception:  # pragma: no cover - 进度写库失败不阻断上传
+            logger.exception(
+                "upload progress write_back failed plan=%s", plan_id
+            )
+
+        try:
+            from app.services.pipeline.events import publish_plan_event
+
+            publish_plan_event(plan_id, "upload_progress", {"plan_id": plan_id, **info})
+        except Exception:  # pragma: no cover - SSE 推送失败也只记日志
+            logger.exception(
+                "upload progress SSE publish failed plan=%s", plan_id
+            )
+
+    return _cb
 
 
 def _load_plan(plan_id: str) -> Optional[dict[str, Any]]:
