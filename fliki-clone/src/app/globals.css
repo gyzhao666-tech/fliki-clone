@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+/* ─── Design Tokens ─── */
+:root {
+  /* brand — Fliki Indigo（对齐真实 --indigo-9 / Fliki app 实测值） */
+  --brand-50:  #f5f8ff;
+  --brand-100: #d2deff;
+  --brand-200: #a6beff;
+  --brand-300: #7a9eff;
+  --brand-400: #6080ee;
+  --brand-500: #5172e4;
+  --brand-600: #3e63dd;
+  --brand-700: #2f4fc2;
+  --brand-800: #2340a0;
+  --brand-900: #1a3080;
+
+  /* neutral */
+  --gray-0:   #ffffff;
+  --gray-25:  #fcfcfd;
+  --gray-50:  #f9f9f9;
+  --gray-100: #f0f0f0;
+  --gray-200: #e8e8e8;
+  --gray-300: #d4d4d4;
+  --gray-400: #b0b0b0;
+  --gray-500: #8d8d8d;
+  --gray-600: #5a5a5a;
+  --gray-700: #3a3a3a;
+  --gray-800: #202020;
+  --gray-900: #141414;
+
+  /* semantic（对齐真实抓取值） */
+  --bg:             #f7f9f8;   /* rgb(247,249,248) */
+  --bg-subtle:      #f0f2f1;
+  --bg-muted:       #e8eae9;
+  --surface:        #ffffff;
+  --surface-hover:  #f7f9f8;
+  --border:         #dfe2e0;   /* --surface-border 真实值 */
+  --border-strong:  #c8ccc9;
+  --text:           #202020;   /* rgb(32,32,32) */
+  --text-secondary: #5a5a5a;
+  --text-muted:     #8d8d8d;
+
+  /* radius */
+  --radius-sm:  4px;
+  --radius-md:  8px;
+  --radius-lg:  12px;
+  --radius-xl:  16px;
+  --radius-2xl: 24px;
+  --radius-full: 9999px;
+
+  /* shadow */
+  --shadow-xs: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+  --shadow-sm: 0 1px 3px 0 rgb(0 0 0 / 0.08), 0 1px 2px -1px rgb(0 0 0 / 0.06);
+  --shadow-md: 0 4px 8px -2px rgb(0 0 0 / 0.08), 0 2px 4px -2px rgb(0 0 0 / 0.04);
+  --shadow-lg: 0 12px 16px -4px rgb(0 0 0 / 0.08), 0 4px 6px -2px rgb(0 0 0 / 0.03);
+  --shadow-xl: 0 20px 24px -4px rgb(0 0 0 / 0.08), 0 8px 8px -4px rgb(0 0 0 / 0.03);
+}
+
+/* ─── Dark mode（保留但不强制启用） */
+.dark, [data-theme="dark"] {
+  --bg:             #111212;
+  --bg-subtle:      #191c1b;
+  --bg-muted:       #252827;
+  --surface:        #1c1f1e;
+  --surface-hover:  #252827;
+  --border:         #2e3130;
+  --border-strong:  #3d4140;
+  --text:           #f0f2f1;
+  --text-secondary: #a8ada9;
+  --text-muted:     #6e7370;
+}
+
+@theme inline {
+  --color-brand:          var(--brand-600);
+  --color-brand-fg:       #ffffff;
+  --color-bg:             var(--bg);
+  --color-bg-subtle:      var(--bg-subtle);
+  --color-bg-muted:       var(--bg-muted);
+  --color-surface:        var(--surface);
+  --color-border:         var(--border);
+  --color-text:           var(--text);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted:     var(--text-muted);
+  --font-sans: var(--font-nunito-sans), "Nunito Sans", system-ui, sans-serif;
+}
+
+/* ─── Base ─── */
+*, *::before, *::after { box-sizing: border-box; }
+
+html { height: 100%; }
+
+body {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-nunito-sans), "Nunito Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-size: 15px;
+  line-height: 1.65;
+}
+
+/* ─── Scrollbar ─── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }

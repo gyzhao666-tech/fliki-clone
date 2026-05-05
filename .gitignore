@@ -1,0 +1,75 @@
+# ── secrets ─────────────────────────────────────────────────────────────────
+# 含真实 SiliconFlow / Kling / Stripe / Google OAuth 等 key，绝对不能进 git。
+.env
+.env.local
+.env.*.local
+.env.production
+*.env
+
+# ── Python ──────────────────────────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.python-version
+.pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# ── Node / Next ─────────────────────────────────────────────────────────────
+node_modules/
+.next/
+out/
+.turbo/
+.parcel-cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ── 平台 / IDE ──────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
+*~
+
+# Cursor 项目级缓存（agent transcripts / terminals 在 ~/.cursor 下，不在仓库）
+.cursor/
+# 但保留团队共享的 rules / hooks 配置（如果以后加进来）
+!.cursor/rules/
+!.cursor/hooks.json
+
+# ── 第三方工具 / 用户自有缓存 ──────────────────────────────────────────────
+.firecrawl/
+# 顶层 package.json 是 firecrawl-cli 安装的副产物（不是 fliki 仓库内容）
+/package.json
+/package-lock.json
+
+# ── 构建产物 / 临时文件 ─────────────────────────────────────────────────────
+*.log
+/tmp/
+.tmp/
+.DS_Store
+
+# ── 本仓库下的另一个独立项目（telegram 下载器，与 fliki 无关）────────────────
+cls-vip-telegram-downloader/
+
+# ── 媒体产物（fliki 后端会写到 static/videos）──────────────────────────────
+fliki-clone-api/static/videos/
+fliki-clone-api/static/audio/
+fliki-clone-api/static/images/
+# 但保留目录骨架便于 dev 运行
+!fliki-clone-api/static/.gitkeep
+
+# alembic 临时
+fliki-clone-api/alembic.ini.local

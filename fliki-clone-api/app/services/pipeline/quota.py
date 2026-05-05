@@ -1,0 +1,505 @@
+"""模型调用配额：预扣 / 退还 / 查询。
+
+并发模型：行级 SELECT ... FOR UPDATE（PG）保证同一 user/tenant 多个并发启动请求互斥；
+SQLite / 测试环境降级到普通 SELECT，因为 fliki 主仓走 PG。
+
+v1（user 级，兼容）API：
+- `get_or_create(user_id) -> QuotaSnapshot`：拉额度，没行就用默认值 INSERT
+- `reserve(user_id, amount) -> ReserveResult`：尝试预扣；失败时返回 reason
+- `release(user_id, amount)`：退还
+- `count_active_runs(user_id) -> int`：当前活跃 run 数
+
+v2（tenant 级，新路径）API：
+- `get_or_create_tenant(tenant_id, *, plan, display_name) -> TenantQuotaSnapshot`
+- `reserve_tenant(tenant_id, amount) -> ReserveResult`
+- `release_tenant(tenant_id, amount)`
+- `count_active_runs_tenant(tenant_id) -> int`
+
+设计取舍：
+- 不引 ORM session：所有查询走 sync engine（与 runner.py 一致），让 Celery worker / BackgroundTask
+  / async router 都能调
+- `current_period_start` 当跨月时由本模块手动 reset：调 `get_or_create*` 时检查是否需要 rollover
+- v1 与 v2 互不耦合，迁移期可并存；router 已切到 v2，runner 退还也走 v2
+"""
+from __future__ import annotations
+
+import logging
+import uuid
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import create_engine, text
+
+from app.config import get_settings
+
+logger = logging.getLogger(__name__)
+
+
+# ── 公共数据类 ────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class QuotaSnapshot:
+    user_id: str
+    monthly_limit_usd: float
+    current_period_usage_usd: float
+    current_period_start: datetime
+    concurrent_max: int
+
+    @property
+    def remaining_usd(self) -> float:
+        return max(0.0, self.monthly_limit_usd - self.current_period_usage_usd)
+
+
+@dataclass
+class ReserveResult:
+    ok: bool
+    reason: Optional[str] = None
+    snapshot: Optional[QuotaSnapshot] = None
+    tenant_snapshot: Optional["TenantQuotaSnapshot"] = None
+
+
+@dataclass
+class TenantQuotaSnapshot:
+    tenant_id: str
+    plan: str
+    monthly_limit_usd: float
+    current_period_usage_usd: float
+    current_period_start: datetime
+    concurrent_max: int
+    display_name: Optional[str] = None
+
+    @property
+    def remaining_usd(self) -> float:
+        return max(0.0, self.monthly_limit_usd - self.current_period_usage_usd)
+
+
+# ── 入口 API ──────────────────────────────────────────────────────────────────
+
+
+def _engine():
+    return create_engine(get_settings().database_url_sync)
+
+
+def get_or_create(user_id: str) -> QuotaSnapshot:
+    """读取 user 的额度行；不存在则用默认值 INSERT。
+    每次调用顺便检查是否要按月 rollover。
+    """
+
+    if not user_id:
+        # 匿名用户给一个临时上限，与系统默认对齐；不会落库
+        return QuotaSnapshot(
+            user_id="",
+            monthly_limit_usd=10.0,
+            current_period_usage_usd=0.0,
+            current_period_start=_period_start_for(_now()),
+            concurrent_max=2,
+        )
+
+    engine = _engine()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT user_id, monthly_limit_usd, current_period_usage_usd,
+                       current_period_start, concurrent_max
+                  FROM model_quotas WHERE user_id = :uid
+                """
+            ),
+            {"uid": user_id},
+        ).fetchone()
+
+        if not row:
+            new_id = str(uuid.uuid4())
+            now = _now()
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO model_quotas
+                        (id, user_id, monthly_limit_usd, current_period_usage_usd,
+                         current_period_start, concurrent_max, created_at, updated_at)
+                    VALUES
+                        (:id, :uid, 10.0, 0, :start, 2, NOW(), NOW())
+                    """
+                ),
+                {"id": new_id, "uid": user_id, "start": now},
+            )
+            return QuotaSnapshot(
+                user_id=user_id,
+                monthly_limit_usd=10.0,
+                current_period_usage_usd=0.0,
+                current_period_start=now,
+                concurrent_max=2,
+            )
+
+        snap = QuotaSnapshot(
+            user_id=row[0],
+            monthly_limit_usd=float(row[1]),
+            current_period_usage_usd=float(row[2]),
+            current_period_start=row[3],
+            concurrent_max=int(row[4]),
+        )
+
+        # 检查是否要按月 rollover
+        expected_start = _period_start_for(_now())
+        if snap.current_period_start.replace(tzinfo=timezone.utc) < expected_start:
+            conn.execute(
+                text(
+                    """
+                    UPDATE model_quotas
+                       SET current_period_usage_usd = 0,
+                           current_period_start = :start,
+                           updated_at = NOW()
+                     WHERE user_id = :uid
+                    """
+                ),
+                {"uid": user_id, "start": expected_start},
+            )
+            snap.current_period_usage_usd = 0.0
+            snap.current_period_start = expected_start
+
+        return snap
+
+
+def reserve(user_id: str, amount: float) -> ReserveResult:
+    """尝试预扣 `amount` USD；失败时返回 reason 不修改 DB。
+    匿名用户（user_id 为空）直接放行（不写库）。
+    """
+
+    if amount < 0:
+        return ReserveResult(ok=False, reason="amount must be non-negative")
+    if not user_id:
+        return ReserveResult(ok=True, snapshot=get_or_create(""))
+
+    snap = get_or_create(user_id)  # 顺便 rollover
+    engine = _engine()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT monthly_limit_usd, current_period_usage_usd
+                  FROM model_quotas WHERE user_id = :uid FOR UPDATE
+                """
+            ),
+            {"uid": user_id},
+        ).fetchone()
+        if not row:  # 极端情况：被并发删除
+            return ReserveResult(ok=False, reason="quota row missing after get_or_create")
+
+        limit = float(row[0])
+        usage = float(row[1])
+        if usage + amount > limit + 1e-6:
+            return ReserveResult(
+                ok=False,
+                reason=(
+                    f"insufficient quota: need ${amount:.4f}, "
+                    f"used ${usage:.4f}/${limit:.2f}"
+                ),
+                snapshot=snap,
+            )
+
+        conn.execute(
+            text(
+                """
+                UPDATE model_quotas
+                   SET current_period_usage_usd = current_period_usage_usd + :amt,
+                       updated_at = NOW()
+                 WHERE user_id = :uid
+                """
+            ),
+            {"uid": user_id, "amt": float(amount)},
+        )
+
+    new_snap = QuotaSnapshot(
+        user_id=user_id,
+        monthly_limit_usd=snap.monthly_limit_usd,
+        current_period_usage_usd=snap.current_period_usage_usd + amount,
+        current_period_start=snap.current_period_start,
+        concurrent_max=snap.concurrent_max,
+    )
+    return ReserveResult(ok=True, snapshot=new_snap)
+
+
+def release(user_id: str, amount: float) -> None:
+    """退还 amount USD（用于终态结算 reserved - actual 的差）。
+    `amount <= 0` 跳过（实际花费 >= 预扣时不需要退）。
+    """
+
+    if not user_id or amount <= 1e-6:
+        return
+    engine = _engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE model_quotas
+                   SET current_period_usage_usd =
+                       GREATEST(0, current_period_usage_usd - :amt),
+                       updated_at = NOW()
+                 WHERE user_id = :uid
+                """
+            ),
+            {"uid": user_id, "amt": float(amount)},
+        )
+
+
+def count_active_runs(user_id: str) -> int:
+    """活跃 = 还没进入终态（succeeded / failed / cancelled）的 run 数。"""
+
+    if not user_id:
+        return 0
+    engine = _engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM pipeline_runs
+                 WHERE user_id = :uid
+                   AND state NOT IN ('succeeded','failed','cancelled')
+                """
+            ),
+            {"uid": user_id},
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+
+# ── v2: tenant 级 API ────────────────────────────────────────────────────────
+# 与 v1 几乎对称，只是主键换成 tenant_id；多了 plan / display_name。
+# router 与 runner 终态退还都已切到 v2；v1 仅保留作向后兼容（老脚本/老 router 调用）。
+
+
+def get_or_create_tenant(
+    tenant_id: str,
+    *,
+    plan: str = "free",
+    display_name: Optional[str] = None,
+) -> TenantQuotaSnapshot:
+    """读取 tenant 配额行；不存在则按 plan 默认值 INSERT。每次顺便 rollover。
+
+    匿名 tenant_id（包含 `anon:`）拿一份「不落库」snapshot，避免 dev 测试污染表。
+    """
+    if not tenant_id:
+        raise ValueError("tenant_id required")
+    if tenant_id.startswith("anon:"):
+        return TenantQuotaSnapshot(
+            tenant_id=tenant_id,
+            plan="free",
+            monthly_limit_usd=10.0,
+            current_period_usage_usd=0.0,
+            current_period_start=_period_start_for(_now()),
+            concurrent_max=2,
+            display_name=display_name or "(anonymous)",
+        )
+
+    # 局部 import 避免 quota.py 顶层依赖 tenant.py（quota 更底层）
+    from .tenant import plan_defaults
+
+    defaults = plan_defaults(plan)
+    monthly_default = float(defaults["monthly_limit_usd"])
+    concurrent_default = int(defaults["concurrent_max"])
+
+    engine = _engine()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT tenant_id, display_name, plan, monthly_limit_usd,
+                       current_period_usage_usd, current_period_start, concurrent_max
+                  FROM tenant_quotas WHERE tenant_id = :tid
+                """
+            ),
+            {"tid": tenant_id},
+        ).fetchone()
+
+        if not row:
+            now = _now()
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO tenant_quotas
+                        (tenant_id, display_name, plan,
+                         monthly_limit_usd, current_period_usage_usd,
+                         current_period_start, concurrent_max,
+                         created_at, updated_at)
+                    VALUES
+                        (:tid, :dn, :plan, :limit, 0, :start, :cmax, NOW(), NOW())
+                    """
+                ),
+                {
+                    "tid": tenant_id,
+                    "dn": display_name,
+                    "plan": plan,
+                    "limit": monthly_default,
+                    "start": now,
+                    "cmax": concurrent_default,
+                },
+            )
+            return TenantQuotaSnapshot(
+                tenant_id=tenant_id,
+                plan=plan,
+                monthly_limit_usd=monthly_default,
+                current_period_usage_usd=0.0,
+                current_period_start=now,
+                concurrent_max=concurrent_default,
+                display_name=display_name,
+            )
+
+        snap = TenantQuotaSnapshot(
+            tenant_id=row[0],
+            display_name=row[1],
+            plan=row[2],
+            monthly_limit_usd=float(row[3]),
+            current_period_usage_usd=float(row[4]),
+            current_period_start=row[5],
+            concurrent_max=int(row[6]),
+        )
+
+        # 跨月 rollover
+        expected_start = _period_start_for(_now())
+        if snap.current_period_start.replace(tzinfo=timezone.utc) < expected_start:
+            conn.execute(
+                text(
+                    """
+                    UPDATE tenant_quotas
+                       SET current_period_usage_usd = 0,
+                           current_period_start = :start,
+                           updated_at = NOW()
+                     WHERE tenant_id = :tid
+                    """
+                ),
+                {"tid": tenant_id, "start": expected_start},
+            )
+            snap.current_period_usage_usd = 0.0
+            snap.current_period_start = expected_start
+
+        # display_name 来自 caller 的最新值（user.email / workspace.name）覆盖
+        if display_name and display_name != snap.display_name:
+            conn.execute(
+                text(
+                    "UPDATE tenant_quotas SET display_name=:dn, updated_at=NOW() WHERE tenant_id=:tid"
+                ),
+                {"tid": tenant_id, "dn": display_name},
+            )
+            snap.display_name = display_name
+
+        return snap
+
+
+def reserve_tenant(
+    tenant_id: str,
+    amount: float,
+    *,
+    plan: str = "free",
+    display_name: Optional[str] = None,
+) -> ReserveResult:
+    """tenant 级 reserve。匿名 tenant 直接放行不落库。"""
+    if amount < 0:
+        return ReserveResult(ok=False, reason="amount must be non-negative")
+    snap = get_or_create_tenant(tenant_id, plan=plan, display_name=display_name)
+    if tenant_id.startswith("anon:"):
+        return ReserveResult(ok=True, tenant_snapshot=snap)
+
+    engine = _engine()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT monthly_limit_usd, current_period_usage_usd
+                  FROM tenant_quotas WHERE tenant_id = :tid FOR UPDATE
+                """
+            ),
+            {"tid": tenant_id},
+        ).fetchone()
+        if not row:  # pragma: no cover - get_or_create 刚 INSERT
+            return ReserveResult(ok=False, reason="tenant_quotas row missing after upsert")
+
+        limit = float(row[0])
+        usage = float(row[1])
+        if usage + amount > limit + 1e-6:
+            return ReserveResult(
+                ok=False,
+                reason=(
+                    f"insufficient tenant quota ({tenant_id}): need ${amount:.4f}, "
+                    f"used ${usage:.4f}/${limit:.2f}"
+                ),
+                tenant_snapshot=snap,
+            )
+
+        conn.execute(
+            text(
+                """
+                UPDATE tenant_quotas
+                   SET current_period_usage_usd = current_period_usage_usd + :amt,
+                       updated_at = NOW()
+                 WHERE tenant_id = :tid
+                """
+            ),
+            {"tid": tenant_id, "amt": float(amount)},
+        )
+
+    new_snap = TenantQuotaSnapshot(
+        tenant_id=tenant_id,
+        plan=snap.plan,
+        monthly_limit_usd=snap.monthly_limit_usd,
+        current_period_usage_usd=snap.current_period_usage_usd + amount,
+        current_period_start=snap.current_period_start,
+        concurrent_max=snap.concurrent_max,
+        display_name=snap.display_name,
+    )
+    return ReserveResult(ok=True, tenant_snapshot=new_snap)
+
+
+def release_tenant(tenant_id: str, amount: float) -> None:
+    """退还 tenant 级 amount USD（用于终态结算 / cancel）。"""
+    if not tenant_id or tenant_id.startswith("anon:") or amount <= 1e-6:
+        return
+    engine = _engine()
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE tenant_quotas
+                   SET current_period_usage_usd =
+                       GREATEST(0, current_period_usage_usd - :amt),
+                       updated_at = NOW()
+                 WHERE tenant_id = :tid
+                """
+            ),
+            {"tid": tenant_id, "amt": float(amount)},
+        )
+
+
+def count_active_runs_tenant(tenant_id: str) -> int:
+    """活跃 = 没进入终态的 run 数（按 pipeline_runs.tenant_id）。
+
+    匿名（anon:）tenant 共享一个桶，仍按列名一起 count；调用方应自行决定
+    要不要给匿名放行（router 当前给匿名放行）。
+    """
+    if not tenant_id:
+        return 0
+    engine = _engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) FROM pipeline_runs
+                 WHERE tenant_id = :tid
+                   AND state NOT IN ('succeeded','failed','cancelled')
+                """
+            ),
+            {"tid": tenant_id},
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+
+# ── helpers ──────────────────────────────────────────────────────────────────
+
+
+def _now() -> datetime:
+    return datetime.now(tz=timezone.utc)
+
+
+def _period_start_for(when: datetime) -> datetime:
+    """当前自然月的第一天 UTC 00:00。"""
+    return datetime(when.year, when.month, 1, tzinfo=timezone.utc)

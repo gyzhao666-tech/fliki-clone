@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "title": "{brand} - {tagline}",
+    "tagline": "几分钟完成 AI 视频与配音",
+    "description": "把想法、博客或脚本变成精彩视频：AI 配音、素材与配乐，零基础也能上手。"
+  },
+  "locale": {
+    "switch": "切换语言",
+    "en": "英文",
+    "zh": "中文"
+  },
+  "marketing": {
+    "footer": {
+      "brandTagline": "几分钟内完成 AI 视频与配音。",
+      "columns": [
+        {
+          "title": "产品",
+          "links": ["文本转视频", "AI 配音", "AI 数字人", "定价"]
+        },
+        {
+          "title": "公司",
+          "links": ["关于", "企业版", "新闻", "联系"]
+        },
+        {
+          "title": "资源",
+          "links": ["模板", "博客", "帮助中心", "API"]
+        },
+        {
+          "title": "法律",
+          "links": ["隐私", "条款"]
+        }
+      ],
+      "copyright": "© {year} Fliki。保留所有权利。",
+      "madeWith": "由 AI 驱动"
+    }
+  },
+  "topbar": {
+    "searchPlaceholder": "搜索文件、模板...",
+    "plan": "套餐",
+    "min": "分钟",
+    "profile": "个人资料",
+    "billing": "账单",
+    "signOut": "退出登录"
+  },
+  "settingsPage": {
+    "title": "设置",
+    "subtitle": "管理你的个人资料和账单偏好。",
+    "profile": "个人资料",
+    "billing": "账单"
+  },
+  "accountPage": {
+    "title": "账户",
+    "subtitle": "管理奖励、推荐和联盟设置。",
+    "profile": "个人资料",
+    "rewards": "奖励",
+    "referrals": "推荐",
+    "affiliate": "联盟"
+  }
+}

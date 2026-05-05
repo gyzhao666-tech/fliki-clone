@@ -1,0 +1,59 @@
+{
+  "metadata": {
+    "title": "{brand} - {tagline}",
+    "tagline": "Create AI Videos & Voiceovers in Minutes",
+    "description": "Turn your ideas, blog posts, or scripts into stunning videos with AI voices, stock footage, and music - no editing experience required."
+  },
+  "locale": {
+    "switch": "Switch language",
+    "en": "English",
+    "zh": "Chinese"
+  },
+  "marketing": {
+    "footer": {
+      "brandTagline": "Create AI videos and voiceovers in minutes.",
+      "columns": [
+        {
+          "title": "Product",
+          "links": ["Text to Video", "AI Voiceover", "AI Avatars", "Pricing"]
+        },
+        {
+          "title": "Company",
+          "links": ["About", "Enterprise", "Press", "Contact"]
+        },
+        {
+          "title": "Resources",
+          "links": ["Templates", "Blog", "Help Center", "API"]
+        },
+        {
+          "title": "Legal",
+          "links": ["Privacy", "Terms"]
+        }
+      ],
+      "copyright": "© {year} Fliki. All rights reserved.",
+      "madeWith": "Made with AI"
+    }
+  },
+  "topbar": {
+    "searchPlaceholder": "Search files, templates...",
+    "plan": "Plan",
+    "min": "min",
+    "profile": "Profile",
+    "billing": "Billing",
+    "signOut": "Sign out"
+  },
+  "settingsPage": {
+    "title": "Settings",
+    "subtitle": "Manage your profile and billing preferences.",
+    "profile": "Profile",
+    "billing": "Billing"
+  },
+  "accountPage": {
+    "title": "Account",
+    "subtitle": "Manage rewards, referrals, and affiliate settings.",
+    "profile": "Profile",
+    "rewards": "Rewards",
+    "referrals": "Referrals",
+    "affiliate": "Affiliate"
+  }
+}
