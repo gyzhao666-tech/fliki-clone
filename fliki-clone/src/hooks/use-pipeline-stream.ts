@@ -17,13 +17,19 @@ import {
  * 把 backend 事件 patch 到调用方维护的 `run` state。
  *
  * 协议（与后端 `app/routers/pipelines.py` 对齐）：
- *   - event: snapshot   data: <PipelineRun>     连接首条；用它对齐全量
+ *   - id: <stream_id>                              Track-17：每条事件带 redis Stream id
+ *   - event: snapshot   data: <PipelineRun>     连接首条；用它对齐全量（不带 id）
  *   - event: step_state data: <PipelineStep + run_id>  单步变化
  *   - event: run_state  data: <PipelineRun minus steps> run 顶层变化
  *   - 注释行 `: ping`                              心跳；EventSource 自动忽略
  *
  * 行为：
- *   - 连接错误且未达终态 → 退到 2.5s polling fallback（保留旧行为，避免全黑屏）
+ *   - **浏览器自动断网重连（Track-17）**：原生 EventSource 收到带 `id:` 的事件后会把
+ *     id 缓存到 `lastEventId`，断网时进入 CONNECTING 状态自动重连，并把 `lastEventId`
+ *     通过 `Last-Event-ID` 头送回服务端；后端从 redis Stream 该 id 之后续推，不丢事件。
+ *   - 因此 onerror 时 hook **不主动 close** EventSource（只要 readyState 仍是 CONNECTING），
+ *     给浏览器原生重连留机会；仅当 readyState 进入 CLOSED（server 拒绝 / 鉴权失败 /
+ *     CORS 等不可恢复错误）才计入失败次数，连续多次后 fallback polling，避免全黑屏。
  *   - run 终态 → 关闭 EventSource + polling
  *   - 输入 runId 变化时自动重连
  *
@@ -32,7 +38,8 @@ import {
  */
 
 const POLL_INTERVAL_MS = 2500;
-const FALLBACK_AFTER_FAILURES = 2; // 连续失败次数 → 退到 polling
+// CLOSED 后连续失败次数 → 退到 polling（CONNECTING 状态不计数，让浏览器原生 Last-Event-ID 续传）
+const FALLBACK_AFTER_FAILURES = 2;
 
 type StreamMode = "idle" | "stream" | "polling";
 
@@ -188,7 +195,14 @@ export function usePipelineStream({
       });
 
       es.addEventListener("error", () => {
-        // SSE 自动重连机制不可靠（鉴权过期 / 后端重启），自己计数 fallback
+        // Track-17：先看 readyState，让浏览器原生重连（带 Last-Event-ID）有机会续传。
+        // - CONNECTING (0)：浏览器在自动重连，redis Stream 会从 lastEventId 后续推 → 不计失败
+        // - CLOSED   (2)：服务端拒绝 / 鉴权失败 / CORS 等不可恢复 → 计失败 → 达阈值 fallback polling
+        const state = es?.readyState ?? EventSource.CLOSED;
+        if (state !== EventSource.CLOSED) {
+          // CONNECTING / OPEN：浏览器在重连，不打断
+          return;
+        }
         consecutiveErrors += 1;
         if (consecutiveErrors >= FALLBACK_AFTER_FAILURES) {
           if (es) {

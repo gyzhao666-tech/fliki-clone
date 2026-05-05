@@ -399,8 +399,22 @@ _SSE_HEARTBEAT_SEC = 25.0
 _SSE_MAX_DURATION_SEC = 30 * 60.0  # 兜底防止连接永远不释放
 
 
-def _sse_format(event: str, data: dict[str, Any]) -> str:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+def _sse_format(
+    event: str, data: dict[str, Any], *, event_id: str | None = None
+) -> str:
+    """格式化一条 SSE 事件。
+
+    Track-17：可选 `event_id` 写到 `id:` 字段。浏览器原生 EventSource 会
+    自动把最近一条 `id:` 缓存到内置 lastEventId，断网重连时通过
+    `Last-Event-ID` 请求头送回服务端，让 backend 从断点续传 redis Stream。
+    snapshot 是连接首条全量对齐，不来自 redis Stream，`event_id` 缺省 None。
+    """
+
+    head = f"id: {event_id}\n" if event_id else ""
+    return (
+        f"{head}event: {event}\n"
+        f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+    )
 
 
 def _step_to_event_payload(step: "StepOut") -> dict[str, Any]:
@@ -421,8 +435,15 @@ _TERMINAL_RUN_STATES = {"succeeded", "failed", "cancelled"}
 async def _pipeline_sse_stream(
     run_id: str,
     request: Request,
+    *,
+    last_event_id: str | None = None,
 ) -> AsyncIterator[str]:
     """打开一个 SSE 流：snapshot → 订阅 redis 事件 → 终态后关闭。
+
+    Track-17：`last_event_id` 来自请求头 `Last-Event-ID`（浏览器原生 EventSource
+    断网重连时自动带）；非空时透传给 `pipeline_events.subscribe(...)` 让
+    redis Stream 从断点继续推，不丢断网期间的事件。snapshot 仍照发，前端可以
+    根据 stream 续传的 step_state / run_state 增量合并到 snapshot 上。
 
     断开条件（任一）：
     - 客户端断开（`request.is_disconnected`）
@@ -442,7 +463,9 @@ async def _pipeline_sse_stream(
     loop = asyncio.get_event_loop()
     deadline = loop.time() + _SSE_MAX_DURATION_SEC
     last_hb = loop.time()
-    sub_iter = pipeline_events.subscribe(run_id, stop_event=stop_event)
+    sub_iter = pipeline_events.subscribe(
+        run_id, last_event_id=last_event_id, stop_event=stop_event
+    )
 
     try:
         async for tick_msg in sub_iter:
@@ -459,8 +482,8 @@ async def _pipeline_sse_stream(
                     last_hb = now
                 continue
 
-            event_type, payload = tick_msg
-            yield _sse_format(event_type, payload)
+            event_type, payload, event_id = tick_msg
+            yield _sse_format(event_type, payload, event_id=event_id)
             last_hb = now
 
             # run 进入终态后给其他事件留 200ms 缓冲再断开
@@ -484,8 +507,10 @@ async def pipeline_events_stream(
     request: Request,
 ):
     _ensure_run_owner(run_id, current_user.id)
+    # Track-17：浏览器自动带的 Last-Event-ID 头透传给 subscribe → redis XREAD
+    last_event_id = request.headers.get("Last-Event-ID") or None
     return StreamingResponse(
-        _pipeline_sse_stream(run_id, request),
+        _pipeline_sse_stream(run_id, request, last_event_id=last_event_id),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",
