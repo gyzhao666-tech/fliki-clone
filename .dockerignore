@@ -1,0 +1,52 @@
+# Track-28 · 仓库根 .dockerignore
+# 注：docker build 默认只读取 build context 根的 .dockerignore；
+# 真正生效的副本在 fliki-clone-api/.dockerignore 与 fliki-clone/.dockerignore，
+# 此根文件保留是仓库级清单 / 文档备忘，避免后续 someone 把 build context 升到仓库根时重新踩坑。
+.git
+.gitignore
+.github
+.vscode
+.idea
+.cursor
+
+# Python
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+coverage
+htmlcov
+*.egg-info
+
+# Node
+node_modules
+.next
+.turbo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor
+*.swp
+.DS_Store
+
+# Build artifacts
+build
+dist
+
+# Docs / NOTES（不进镜像）
+*.md
+docs
+TRACK_*_NOTES.md
+SESSION_HANDOFF.md
+AGENTS_BACKLOG.md
+DEVELOPMENT_PLAN.md
+E2E_VERIFY_REPORT.md
