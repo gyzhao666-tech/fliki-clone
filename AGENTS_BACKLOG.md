@@ -292,18 +292,124 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 - **分支**：`track-19-multi-ip-adapter`（不创建本地分支，标 ⏸）
 - **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
 
-## 2.7 第五波候选（待派；可同时派发）
+## 2.7 第五波（4 条 feature 分支已预创建本地；T-24 待 T-23 合并后再派；T-20 协调者自跑）
 
-> 当前 v1 核心闭环已就绪，剩余都是「优化 / 长尾」。建议派发节奏：3-5 个 Cursor Agent Window 同时跑，每个半天到 1.5 天。
+> 派发原则：本批 5 条同时派发（T-20 协调者自跑不算 agent）；alembic 互斥锁本批没人占用（T-24 ⏸ 待 T-23）；
+> `routers/admin_flags.py` 的 `_is_admin_email` / `_require_admin` 由 T-23 独占，T-24 必须等 T-23 合并后再派。
+> 累计工作量 ≈ 0.5 + 1.5 + 1 + 0.5 + 0.5 = 4 天（4 个 agent 并行 ≈ 1.5 天墙钟，再加 T-24 串行 1.5 天）。
 
-| 优先级 | Track ID | 内容 | 工作量 | 互斥锁 |
-|---|---|---|---|---|
-| ★★ | T-20 | YouTube + Stripe 真账号 e2e（用户配真 key 跑一次完整链路；写 e2e 报告 + 截图） | 半天 | 不动代码（仅文档 + .env 配置 + 跑) |
-| ★ | T-21 | L-03 metric dashboard 升级（用 T-18 的 model_calls.tenant_id 做按天 / provider 时序图；新前端 `/app/admin/metrics` 页面 + 后端 `/api/cost/timeseries` 端点） | 1.5 天 | 后端 `routers/cost.py` 加 `/timeseries` 段；前端独占新页面 |
-| ★ | T-22 | L-04 月账单 PDF + 邮件（拿 stripe `invoice.paid` 渲染 PDF + 调 fastapi-mail 发送） | 1 天 | 后端独占 `services/billing/invoice_pdf.py` + `services/email/` 新模块 |
-| ★ | T-23 | L-13 `ADMIN_EMAILS` 迁回 `Settings`（Track-10/14/18 都通过 `os.environ` 直读，本 Track 一次性收口） | 0.5 天 | 改 `app/config.py` 加字段；前端不动 |
-| ★ | T-24 | L-05 真 RBAC（workspace member editor/viewer/admin role；替换 Track-10/14 邮箱白名单） | 1.5 天 | 新 alembic 加 `team_members.role` 列 + 改 `_require_admin` 逻辑 |
-| ★ | T-25 | L-10 配额超限 SSE 实时推送（用 T-17 redis Stream 框架推 `quota_exceeded` 事件给前端 toast） | 半天 | 改 `services/pipeline/quota.py::reserve` 抛事件；前端 hook 订阅 |
+### Track-20 · YouTube + Stripe 真账号 e2e（**协调者自跑，不开 Agent**）★★ (半天)
+
+- **不创建 feature branch**（不动代码）
+- **目标**：跑通真账号端到端，留一份验收报告 + 截图，确认 v1 核心发布闭环 + 计费闭环真实可用
+- **前置准备**：
+  - YouTube：申请 Google Cloud OAuth client（type=desktop / web，scope `https://www.googleapis.com/auth/youtube.upload`）→ `.env` 配 `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
+  - Stripe：登录 dashboard.stripe.com test mode → 复制 `STRIPE_SECRET_KEY=sk_test_...` + 创建 3 个 product + 3 个 price → 拷贝 `STRIPE_PRICE_STANDARD/PREMIUM/FREE` 到 `.env`
+  - 启 Stripe CLI 转发 webhook：`stripe listen --forward-to http://127.0.0.1:8000/api/billing/webhook` → 拷贝 webhook signing secret 到 `.env`
+- **执行步骤**：
+  1. 重启 backend（带新 `.env`）
+  2. 跑一次 60 MB+ 测试视频走 video_full → execute publish_plan → 看 SSE 流 0%→100% + `external_id` 真 youtube id
+  3. 浏览器访问 `/app/billing` → 点 Upgrade → Stripe Checkout 用 4242 卡 → 跳回看 plan badge active + 看 backend log 收 webhook
+  4. 测一次退款：stripe dashboard 找上面那笔 → Refund → 看 webhook log + DB `subscriptions.refunded_at` 写入
+- **交付物**：在仓库根写 `E2E_VERIFY_REPORT.md`：截图 + log 摘要 + 通过/失败结论
+- **不做**：bilibili 真发（依赖 MCN）；任何代码改动
+
+### Track-21 · L-03 metric dashboard：cost 时序图 + admin metrics 页 ★ (1.5 天)
+
+- **分支**：`track-21-metric-dashboard`
+- **目标**：在 T-18 已写入的 `model_calls.tenant_id` 之上做按天 / provider 时序图，让 admin 一眼看出某 tenant 的成本走势
+- **修改文件**：
+  - 后端 `fliki-clone-api/app/routers/cost.py`：加 `GET /api/cost/timeseries?tenant_id=&provider=&period=daily|weekly&days=30`，返 `[{date, provider, cost_usd, call_count}]`（按 `DATE_TRUNC('day', created_at)` 聚合 + 可选 provider filter）
+  - 前端新页面 `fliki-clone/src/app/[locale]/(app)/app/admin/metrics/page.tsx`：tenant 选择器（复用 T-14 的 `listAdminTenants`）+ provider 多选 chips + period toggle + 折线图（推荐用 `recharts` 已在 deps 里）+ 顶部数字 `total_cost / total_calls`
+  - 前端 `fliki-clone/src/lib/cost.ts`：加 `getCostTimeseries(args)` + `CostTimeseriesPoint` 类型
+  - 前端 `fliki-clone/src/components/app-shell/sidebar.tsx`：admin 命中时多渲一个「Admin · Metrics」入口（与 Feature Flags 并列）
+  - 新 `fliki-clone-api/tests/test_track21_timeseries.py` 6+ case：聚合 SQL 正确性 / 缺 provider filter 走全部 / 跨天界限 / 空数据返空数组 / admin 鉴权穿透（复用 `_resolve_query_tenant`）
+- **互斥锁（独占）**：
+  - 后端 `routers/cost.py` 末尾加 `/timeseries` 段（不改既有 `/summary` `/recent`）
+  - 前端 `app/admin/metrics/` 新目录全部独占
+  - `lib/cost.ts` 加新 helper（不动既有 `getCostSummary` / `getRecentCostCalls`）
+  - `sidebar.tsx::adminLinks` 数组加一项（与 T-14 的 admin 入口并列；T-14 已合，文件可读可改）
+- **依赖**：✅ T-18 已合（`model_calls.tenant_id` 列）；✅ T-14 已合（admin 鉴权 + tenant 列表）
+- **烟测**：
+  - 单元：mock SQL 返若干行 → endpoint 返期望结构
+  - 集成：seed 跨 7 天的 model_calls 行 → `?period=daily&days=7` 应返 7 行 / provider；`?provider=siliconflow` 仅返该 provider 的行
+- **不做**：图表 zoom/export（v1 静态图够用）；不动 `/summary` `/recent`
+
+### Track-22 · L-04 月账单 PDF + 邮件 ★ (1 天)
+
+- **分支**：`track-22-invoice-pdf-email`
+- **目标**：拿 stripe `invoice.paid` 事件 → 渲染 PDF（plan + 期内 cost 拆分 + tenant 名称）→ 调 SMTP 发送给 user.email
+- **修改文件**：
+  - 后端新模块 `fliki-clone-api/app/services/billing/invoice_pdf.py`：用 `reportlab`（轻量；放到 requirements 里）渲染 A4 PDF，含 logo / period / plan / 按 provider 拆分表格 / 总金额
+  - 后端新模块 `fliki-clone-api/app/services/email/__init__.py` + `smtp_client.py`：薄封装 stdlib `smtplib`（不引第三方）；缺 SMTP 配置时抛 `EmailNotConfigured` → router 翻 503
+  - 后端 `fliki-clone-api/app/services/billing/webhook_handlers.py`：加 `invoice.paid` dispatch 分支 → `_handle_invoice_paid(invoice, *, event_id)`：找到对应 user → 调 invoice_pdf.render → 调 email.send_invoice → 写 `subscriptions.last_invoice_url`（如果有需要也行可不需要）；缺 SMTP / reportlab 时返 `{handled:True, sent:False, reason:...}` 让 stripe 不重投
+  - `.env.example` 加 `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM`（实际值 user 自己 .env）
+  - `app/config.py` 加 5 条 settings 字段（SMTP_*）+ `invoice_email_enabled: bool = False`（缺省关闭，避免本地误发）
+  - `requirements.txt` 加 `reportlab>=4.0`
+  - 新 `fliki-clone-api/tests/test_track22_invoice_email.py` 5+ case：渲染 PDF 字节非空 + 含 plan/provider 字符串 / SMTP 缺配置抛 EmailNotConfigured / `_handle_invoice_paid` mock smtp 正确调用 / 缺 user.email 安全跳过
+- **互斥锁（独占）**：
+  - 新 `services/billing/invoice_pdf.py`、`services/email/` 模块
+  - `services/billing/webhook_handlers.py::_HANDLERS` 字典加一项 + 新 handler 函数（与 T-16 的 5 既有 handler 共存，不改 dispatch 入口）
+  - `app/config.py` 加新字段（**注意：与 T-23 互斥**，本批 T-22 先改 config，T-23 顶层重构 admin emails 时 rebase 拿到 SMTP 字段）
+  - 新 test 文件 / `.env.example` / `requirements.txt`（追加，不改既有依赖版本）
+- **依赖**：✅ T-16 已合（webhook handler 矩阵 + Subscription 模型）；✅ T-11 已合（subscriptions / users.email）
+- **烟测**：
+  - 单元：渲染 PDF + 字节断言 + dispatch handler smtp mock
+  - 集成（可选）：本地 mailpit / smtp4dev 跑一次端到端
+- **不做**：自动跨月 cron 触发（v1 只在 stripe 真触发 invoice.paid 时发，自然月月底 stripe 会自己触发）；HTML 邮件（先纯文本 + 附件 PDF）
+
+### Track-23 · L-13 ADMIN_EMAILS 迁回 Settings ★ (0.5 天)
+
+- **分支**：`track-23-admin-emails-settings`
+- **目标**：T-10/14/18 都通过 `os.environ.get("ADMIN_EMAILS", "")` 直读，把它正式落到 `app/config.py::Settings`，避免散落各处 + IDE 提示
+- **修改文件**：
+  - `fliki-clone-api/app/config.py`：加 `admin_emails: str = "demo@example.com"` 字段（pydantic-settings 会自动从 env `ADMIN_EMAILS` 读；逗号分隔）
+  - `fliki-clone-api/app/routers/admin_flags.py`：`_allowed_admins()` 改成读 `get_settings().admin_emails`，按逗号 split + lower；保留行为兼容（demo@example.com fallback）
+  - `fliki-clone-api/.env.example`：加 `ADMIN_EMAILS=demo@example.com,you@example.com` 说明
+  - 新 `fliki-clone-api/tests/test_track23_admin_emails.py` 4+ case：缺 env 走 fallback / env 单 / env 多逗号 / 与 `_is_admin_email` 联动正确
+- **互斥锁（独占）**：
+  - `app/config.py` 加新字段（**与 T-22 同时改 config.py**：T-22 加 SMTP\_\* 字段；本批默认 T-22 先合，T-23 拿到 main 后再合，避免冲突。**协调者合并顺序：T-22 → T-23**）
+  - `routers/admin_flags.py::_allowed_admins` 函数体（小段独占）
+  - `.env.example`
+- **依赖**：✅ T-10 / T-14 / T-18 已合（这些 Track 只 _读_ `os.environ`，本 Track 把读源切到 settings 不会破坏行为）
+- **烟测**：单元测试 + 跑全量 pytest 验证 T-10/14/18 既有 89 case 仍 PASS（关键：`_require_admin` 在 fixture 里走的是 `_is_admin_email("demo@example.com")` → 经 settings.admin_emails 默认值仍命中）
+- **不做**：admin role 升级（留给 T-24）
+
+### Track-24 · L-05 真 RBAC（workspace member role）★ (1.5 天) ⏸ **待 T-23 合并后再派**
+
+- **分支**：`track-24-rbac-workspace-role`（**等 T-23 合到 main 后由协调者创建**）
+- **依赖**：✅ T-23 必须先合（保证 `_is_admin_email` 已切到 settings；本 Track 在 settings 字段基础上扩展）
+- **目标**：把 admin 邮箱白名单升级为 workspace member role（`admin` / `editor` / `viewer`）；老 demo@example.com fallback 保留
+- **修改文件**（合并后由协调者写卡片完整 specs；下面是初稿）：
+  - 新 alembic：`team_members` 加 `role: VARCHAR DEFAULT 'editor'` 列 + backfill workspace owner = `admin`
+  - `app/services/auth/rbac.py` 新模块：`get_user_role(user_id, workspace_id) -> "admin"|"editor"|"viewer"|None`；缓存 60s
+  - `routers/admin_flags.py::_require_admin` / `routers/cost.py::_resolve_query_tenant` 改用 `rbac.get_user_role(...) == "admin"`，邮箱白名单作为兜底兼容
+  - 前端 admin 入口逻辑同步切到从 user role 决定（不只是邮箱）
+
+### Track-25 · L-10 配额超限 SSE 实时推送 ★ (0.5 天)
+
+- **分支**：`track-25-quota-exceeded-sse`
+- **目标**：用 T-17 redis Stream 框架推 `quota_exceeded` / `bucket_full` 事件给前端，让用户在「下次跑被拒之前」就看到 toast / 红色徽章，避免突然 402/429 困惑
+- **修改文件**：
+  - 后端 `fliki-clone-api/app/services/pipeline/quota.py::reserve_tenant`：当 reserved + new > limit 时，**抛 402 之前**调 `events.publish_to_channel("user:{user_id}", "quota_exceeded", {...})`（新 channel 类型，与 pipeline / publish_plan 互不打扰）
+  - 后端 `fliki-clone-api/app/services/pipeline/provider_buckets.py::acquire`：当 bucket 满 RATE_LIMITED 时同样推 `bucket_full`
+  - 后端 `fliki-clone-api/app/services/pipeline/events.py`：复用既有 `_publish_to_channel` 内核，新加 `publish_user_event` / `subscribe_user`（channel `user:{user_id}`）
+  - 后端 `fliki-clone-api/app/routers/pipelines.py`：新加 `GET /api/pipelines/user-events` SSE 端点（owner 鉴权：从 cookie 拿 current_user.id）
+  - 前端新 hook `fliki-clone/src/hooks/use-user-events.ts`：subscribe `/pipelines/user-events`；监听 `quota_exceeded` / `bucket_full`；调 `feedback.error` 弹 toast
+  - 前端 `app/[locale]/(app)/layout.tsx`（或全局根）挂上 hook，让所有页面都能收到（不用每个页面都订阅）
+  - 新 `fliki-clone-api/tests/test_track25_quota_sse.py` 4+ case：reserve 超限抛事件 + bucket 满抛事件 + redis 不可用 noop
+- **互斥锁（独占）**：
+  - `services/pipeline/quota.py::reserve_tenant` 函数末尾抛事件段
+  - `services/pipeline/provider_buckets.py::acquire` 抛事件段
+  - `services/pipeline/events.py` 加 `publish_user_event` / `subscribe_user`（不动既有 channel）
+  - `routers/pipelines.py` 加 `GET /api/pipelines/user-events` 段
+  - 新 hook `use-user-events.ts`
+  - `(app)/layout.tsx` 挂载 hook 一行
+- **依赖**：✅ T-17 已合（redis Stream 内核）；✅ T-18 已合（quota.reserve_tenant 是 v2）
+- **烟测**：
+  - 单元：mock redis client 断 publish_user_event 被调 + payload 正确
+  - 集成：起 redis → reserve 真超限 → 第二个进程订阅 user channel 应收到事件
+- **不做**：前端 toast 节流 / 去重（v1 简单 toast 即可）；不影响 pipeline / publish_plan 既有 SSE
 
 ## 3. 长尾（任意时机）
 
