@@ -21,6 +21,11 @@ class ModelCall(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
     user_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
+    # Track-18：配额 v2 的 tenant 命名空间（ws:{workspace_id} / u:{user_id} / anon:default）
+    # 与 pipeline_runs.tenant_id 一致；老行通过 alembic c3d4e5f6a7b8 backfill 为 'u:{user_id}'。
+    # gateway.record_call 优先写 request.tenant_id，缺失时按 user_id 兜底；让按 tenant
+    # 聚合的 cost 查询不需要 join pipeline_runs 反推。
+    tenant_id: Mapped[Optional[str]] = mapped_column(String(200), nullable=True, index=True)
     file_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
     pipeline_step_id: Mapped[Optional[str]] = mapped_column(String, nullable=True, index=True)
 

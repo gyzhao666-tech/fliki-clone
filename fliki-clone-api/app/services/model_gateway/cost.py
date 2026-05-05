@@ -77,6 +77,24 @@ def estimate_cost(
     return 0.0
 
 
+def _resolve_tenant_for_record(
+    explicit_tenant_id: Optional[str],
+    user_id: Optional[str],
+) -> Optional[str]:
+    """Track-18：决定写入 model_calls.tenant_id 的值。
+
+    优先级：explicit_tenant_id > 'u:{user_id}' > None（让 DB 端 NULL 兜底）。
+    与 `app.services.pipeline.tenant.resolve_tenant_id` 的兜底约定保持一致：
+    `ws:{workspace_id}` 由调用方自己塞 explicit_tenant_id；user 级走 `u:{user_id}`；
+    完全匿名路径（user_id 也缺失）保持 NULL，让 backfill 后的 alembic 维持 idempotent。
+    """
+    if explicit_tenant_id:
+        return explicit_tenant_id
+    if user_id:
+        return f"u:{user_id}"
+    return None
+
+
 def record_call(
     *,
     user_id: Optional[str],
@@ -90,15 +108,20 @@ def record_call(
     status: CallStatus,
     error: Optional[str] = None,
     request_summary: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> str:
     """同步写入一条 model_calls。
 
     采用同步引擎写入，保证从 Celery worker / BackgroundTask / async router 都能调用。
     返回 model_call id；写库失败时仍返回生成的 id，但会记 warning（不让记账失败影响业务）。
+
+    Track-18：参数 ``tenant_id`` 由 gateway 显式传入（来自 RenderRequest.tenant_id）；
+    缺失时按 ``user_id`` 推 ``u:{user_id}``，与 pipeline.tenant.resolve_tenant_id 兜底一致。
     """
 
     settings = get_settings()
     record_id = str(uuid.uuid4())
+    effective_tenant_id = _resolve_tenant_for_record(tenant_id, user_id)
     try:
         engine = create_engine(settings.database_url_sync)
         with engine.connect() as conn:
@@ -106,16 +129,19 @@ def record_call(
                 text(
                     """
                     INSERT INTO model_calls
-                        (id, user_id, file_id, pipeline_step_id, provider, model, action,
+                        (id, user_id, tenant_id, file_id, pipeline_step_id,
+                         provider, model, action,
                          cost_usd, duration_ms, status, error, request_summary, created_at)
                     VALUES
-                        (:id, :user_id, :file_id, :pipeline_step_id, :provider, :model, :action,
+                        (:id, :user_id, :tenant_id, :file_id, :pipeline_step_id,
+                         :provider, :model, :action,
                          :cost_usd, :duration_ms, :status, :error, :request_summary, NOW())
                     """
                 ),
                 {
                     "id": record_id,
                     "user_id": user_id,
+                    "tenant_id": effective_tenant_id,
                     "file_id": file_id,
                     "pipeline_step_id": pipeline_step_id,
                     "provider": provider.value,

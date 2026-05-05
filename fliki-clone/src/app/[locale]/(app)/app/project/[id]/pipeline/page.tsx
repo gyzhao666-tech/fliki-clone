@@ -50,6 +50,11 @@ import { useRunShotList } from "@/hooks/use-run-shot-list";
 import { useDlq } from "@/hooks/use-dlq";
 import { usePublishPlanStream } from "@/hooks/use-publish-plan-stream";
 import {
+  CostSummary,
+  ProviderCostRow,
+  getCostSummary,
+} from "@/lib/cost";
+import {
   DLQ_STATUSES,
   DlqItemOut,
   DlqStatus,
@@ -119,6 +124,8 @@ export default function ProjectPipelinePage() {
   const [run, setRun] = useState<PipelineRun | null>(null);
   const [starting, setStarting] = useState(false);
   const [quota, setQuota] = useState<PipelineQuota | null>(null);
+  // Track-18：当前 tenant 本月成本（含按 provider 拆分），跟 quota 一起刷新
+  const [costSummary, setCostSummary] = useState<CostSummary | null>(null);
   const [estimate, setEstimate] = useState<PipelineEstimate | null>(null);
   const [estimating, setEstimating] = useState(false);
   // Track-07：流水线节点 section 视图模式（list / dag）。
@@ -170,12 +177,20 @@ export default function ProjectPipelinePage() {
     if (run?.id) reloadShotList();
   }, [run?.id, artStepState, videoStepState, reloadShotList]);
 
-  // 首次加载 + run 终态变化时刷新 quota（reserve / refund 都会改它）
+  // 首次加载 + run 终态变化时刷新 quota（reserve / refund 都会改它）+ Track-18 cost summary
   const refreshQuota = useCallback(async () => {
     try {
       setQuota(await getPipelineQuota());
     } catch (error) {
       // 静默失败：不影响主流程
+    }
+    try {
+      // Track-18：跟 quota 同步刷新本月成本汇总；run 终态后 record_call 已写完
+      // 拉的就是新数。后端 resolve_query_tenant 会兜底成调用方自己的 tenant_id。
+      const cs = await getCostSummary({ period: "monthly" });
+      setCostSummary(cs);
+    } catch (error) {
+      // 静默失败：cost panel 仅信息展示，不影响主流程
     }
   }, []);
 
@@ -490,6 +505,7 @@ export default function ProjectPipelinePage() {
                   </ul>
                 </details>
               ) : null}
+              <CostBreakdownPanel summary={costSummary} />
             </>
           ) : null}
           {estimate?.by_step?.length ? (
@@ -983,6 +999,70 @@ function Stat({ label, value }: { label: string; value: number }) {
       </div>
     </div>
   );
+}
+
+// Track-18：本月按 tenant 聚合的成本明细（含 provider 拆分横向 bar）。
+// quota 视图是「容量」（reserved / monthly_limit / concurrent_max），这里是「明细」
+// （model_calls 实际写入），数据源不同所以分开渲染；折叠 details 默认收起，避免
+// 干扰主流程；total_cost_usd 与 quota.usage 通常接近但不严格等于（quota 是 run
+// 级 reserve+settle 后的累计；cost 是 model_call 粒度，差额来自 partial_failed
+// 不退还的 reserved 漂移）。
+function CostBreakdownPanel({ summary }: { summary: CostSummary | null }) {
+  if (!summary || summary.by_provider.length === 0) return null;
+  const total = summary.total_cost_usd;
+  // 横向 bar 的归一化基准取 max(provider.cost_usd)，让最大 provider 占 100% 视觉宽度
+  const maxCost = Math.max(...summary.by_provider.map((r) => r.cost_usd), 0.0000001);
+  const periodLabel =
+    summary.period === "weekly"
+      ? "最近 7 天"
+      : summary.period === "daily"
+      ? "最近 24 小时"
+      : "本月";
+  return (
+    <details className="mt-3 rounded bg-muted/30 p-2 text-xs">
+      <summary className="cursor-pointer text-muted-foreground">
+        Provider 成本拆分（{periodLabel} · {summary.by_provider.length} 个 provider · 共 {summary.total_calls} 次调用）
+        · 累计 ${total.toFixed(4)}
+      </summary>
+      <ul className="mt-2 flex flex-col gap-1.5">
+        {summary.by_provider.map((r) => {
+          const pct = Math.min(100, Math.max(0, (r.cost_usd / maxCost) * 100));
+          const tone = providerTone(r.provider);
+          return (
+            <li key={r.provider} className="flex items-center gap-2">
+              <span className="w-24 font-mono text-muted-foreground">
+                {r.provider}
+              </span>
+              <div className="relative h-1.5 flex-1 overflow-hidden rounded bg-muted">
+                <div
+                  className={`absolute left-0 top-0 h-full ${tone}`}
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <span
+                className="tabular-nums text-foreground"
+                title={`成功 ${r.success_count} · 失败 ${r.failed_count}`}
+              >
+                ${r.cost_usd.toFixed(4)} · {r.call_count} 次
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+    </details>
+  );
+}
+
+// 简单 provider → 颜色映射（与既有 provider bucket panel 保持视觉一致：
+// emerald = OpenAI 系（贵但稳）; sky = SiliconFlow（便宜量大）; amber = Kling 视频）。
+function providerTone(provider: string): string {
+  const p = provider.toLowerCase();
+  if (p.includes("openai")) return "bg-emerald-500";
+  if (p.includes("siliconflow")) return "bg-sky-500";
+  if (p.includes("kling")) return "bg-amber-500";
+  if (p.includes("elevenlabs")) return "bg-violet-500";
+  if (p.includes("faster_whisper") || p.includes("local")) return "bg-slate-500";
+  return "bg-muted-foreground/50";
 }
 
 function RunStatePill({ state }: { state: PipelineRun["state"] }) {

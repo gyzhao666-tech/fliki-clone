@@ -196,6 +196,9 @@ class Gateway:
             request_summary = _summarise_request(request)
             record_id = record_call(
                 user_id=request.user_id,
+                # Track-18：把 request 显式塞的 tenant_id 透传到记账层；
+                # cost.record_call 内部会兜底成 'u:{user_id}'，记账与配额 v2 同维度
+                tenant_id=request.tenant_id,
                 file_id=request.file_id,
                 pipeline_step_id=request.pipeline_step_id,
                 provider=result.provider or ProviderName.DEMO,
