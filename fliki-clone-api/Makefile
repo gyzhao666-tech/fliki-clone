@@ -1,8 +1,12 @@
-.PHONY: install dev worker migrate upgrade seed lint fmt test
+.PHONY: install install-dev dev worker migrate upgrade seed lint fmt test test-unit test-integration test-cov
 
 # ── Setup ─────────────────────────────────────────────
 install:
 	python -m pip install -r requirements.txt
+
+# 测试 / 开发依赖（pytest 等），独立于业务运行时依赖
+install-dev:
+	python -m pip install -r requirements-dev.txt
 
 venv:
 	python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
@@ -53,8 +57,17 @@ fmt:
 	ruff format app/
 
 # ── Tests ─────────────────────────────────────────────
+# 全套（unit + integration；缺 PG 时 integration 自动 skip 不挂红）
 test:
 	pytest tests/ -v
+
+# 仅纯单元（不连 PG / 不调外部）；CI 默认门禁推荐用这条
+test-unit:
+	pytest tests/ -v -m unit
+
+# 仅集成（需要本地 PG 跑过 alembic upgrade head）
+test-integration:
+	pytest tests/ -v -m integration
 
 test-cov:
 	pytest tests/ -v --cov=app --cov-report=html

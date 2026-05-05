@@ -1,0 +1,13 @@
+# Track-08 引入：本地 + CI 跑 pytest 套件需要的最小依赖
+# 业务依赖在 requirements.txt；这里只放测试 / 开发 / lint 工具
+# 安装：.venv/bin/pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+# pytest 主体；9.x 需要 pluggy>=1.5（pytest 自带依赖会拉）
+pytest>=8.3,<10
+# 异步测试支持（虽然当前所有 case 都同步，留着便于后续 async router 测）
+pytest-asyncio>=0.23,<2
+# httpx 已在 requirements.txt（FastAPI test client 走它），这里再列一遍便于
+# 单独 `pip install -r requirements-dev.txt` 跑 unit 时也拉到
+httpx>=0.27
