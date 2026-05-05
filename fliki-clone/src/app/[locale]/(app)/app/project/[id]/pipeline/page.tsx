@@ -28,6 +28,7 @@ import {
 import { Link } from "@/i18n/navigation";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/input";
+import { DagView } from "@/components/pipeline/dag-view";
 import { feedback } from "@/lib/feedback";
 import { ApiError } from "@/lib/api";
 import {
@@ -119,6 +120,35 @@ export default function ProjectPipelinePage() {
   const [quota, setQuota] = useState<PipelineQuota | null>(null);
   const [estimate, setEstimate] = useState<PipelineEstimate | null>(null);
   const [estimating, setEstimating] = useState(false);
+  // Track-07：流水线节点 section 视图模式（list / dag）。
+  // 默认 list；切到 dag 后写入 localStorage `pipeline.view`，刷新后恢复。
+  // 仅作用于「流水线节点」section，其他 panel 不受影响。
+  const [pipelineView, setPipelineView] = useState<"list" | "dag">("list");
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const saved = window.localStorage.getItem("pipeline.view");
+    if (saved === "dag" || saved === "list") setPipelineView(saved);
+  }, []);
+  const setPipelineViewPersist = useCallback((v: "list" | "dag") => {
+    setPipelineView(v);
+    if (typeof window !== "undefined") {
+      window.localStorage.setItem("pipeline.view", v);
+    }
+  }, []);
+  // 点 DAG 节点 → 滚动到对应 step 卡片（StepCard <li id="step-{name}"/>）。
+  // 即使当前视图是 dag，也保留下方 list（DOM 始终在），只是用 hidden 控制可视性，
+  // 这样切回 list 也无需重渲；scrollIntoView 在 hidden 时不生效，因此点击时强制切回 list。
+  const handleDagNodeClick = useCallback((stepName: string) => {
+    if (typeof window === "undefined") return;
+    const el = window.document.getElementById(`step-${stepName}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      el.classList.add("ring-2", "ring-blue-500/40");
+      window.setTimeout(() => {
+        el.classList.remove("ring-2", "ring-blue-500/40");
+      }, 1500);
+    }
+  }, []);
 
   // SSE：替代 2.5s polling；run 终态后 hook 自动断开 EventSource。
   // 连接错误时 hook 内部会退化到 polling，UI 仍能更新。
@@ -490,6 +520,41 @@ export default function ProjectPipelinePage() {
             {run && !isRunTerminal(run.state) ? (
               <StreamModeBadge mode={streamMode} />
             ) : null}
+            {/* Track-07：list / DAG 视图切换。默认 list；选择记忆 localStorage `pipeline.view` */}
+            <div
+              className="ml-2 inline-flex overflow-hidden rounded border border-border text-[11px]"
+              role="tablist"
+              aria-label="流水线节点视图切换"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={pipelineView === "list"}
+                onClick={() => setPipelineViewPersist("list")}
+                className={
+                  "px-2 py-0.5 transition-colors " +
+                  (pipelineView === "list"
+                    ? "bg-emerald-500/10 text-emerald-500"
+                    : "text-muted-foreground hover:bg-muted/40")
+                }
+              >
+                列表
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={pipelineView === "dag"}
+                onClick={() => setPipelineViewPersist("dag")}
+                className={
+                  "border-l border-border px-2 py-0.5 transition-colors " +
+                  (pipelineView === "dag"
+                    ? "bg-emerald-500/10 text-emerald-500"
+                    : "text-muted-foreground hover:bg-muted/40")
+                }
+              >
+                DAG
+              </button>
+            </div>
           </div>
           {run ? (
             <Button variant="ghost" size="sm" onClick={handleManualRefresh}>
@@ -503,6 +568,15 @@ export default function ProjectPipelinePage() {
           <p className="text-sm text-muted-foreground">
             还没启动流水线。在左侧填写 Brief 后点“启动流水线”。
           </p>
+        ) : pipelineView === "dag" ? (
+          <DagView
+            run={run}
+            onNodeClick={(name) => {
+              // 切回 list 让目标 step 卡片可见，再 scrollIntoView
+              setPipelineViewPersist("list");
+              window.requestAnimationFrame(() => handleDagNodeClick(name));
+            }}
+          />
         ) : (
           <ol className="flex flex-col gap-3">
             {run.steps.map((step, index) => (
@@ -992,7 +1066,10 @@ function StepCard({
   );
 
   return (
-    <li className="flex flex-col gap-2 rounded border border-border bg-background/40 p-3">
+    <li
+      id={`step-${step.name}`}
+      className="flex flex-col gap-2 rounded border border-border bg-background/40 p-3 scroll-mt-20 transition-shadow"
+    >
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
           <span className="text-xs text-muted-foreground tabular-nums">
