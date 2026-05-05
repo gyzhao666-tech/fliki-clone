@@ -96,6 +96,36 @@ class Settings(BaseSettings):
     # （dev / 单机测试 / 没起 redis 都能继续工作）。
     celery_enabled: bool = False
 
+    # Publishing 凭证 Fernet 对称加密 KEY（Track-01）。
+    # url-safe base64 编码的 32-byte key（Fernet.generate_key() 输出格式）；
+    # 留空时 credentials.py 会 fallback 到 plain text 写库（向后兼容老库）+ 启动 logger.warning。
+    publish_credential_fernet_key: str = ""
+
+    @field_validator("publish_credential_fernet_key", mode="before")
+    @classmethod
+    def normalize_publish_credential_fernet_key(cls, v: object) -> object:
+        if not isinstance(v, str):
+            return v
+        s = v.strip()
+        if not s:
+            return ""
+        # 校验：base64 解出来必须是 32 字节，不然 Fernet 会在调用时炸；
+        # 这里早 fail，避免后端能起来但每次写库都 500。
+        try:
+            import base64
+
+            raw = base64.urlsafe_b64decode(s.encode("ascii"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "PUBLISH_CREDENTIAL_FERNET_KEY 必须是 url-safe base64 编码"
+            ) from exc
+        if len(raw) != 32:
+            raise ValueError(
+                "PUBLISH_CREDENTIAL_FERNET_KEY 解码后必须是 32 字节 "
+                "（用 Fernet.generate_key() 生成）"
+            )
+        return s
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

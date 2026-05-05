@@ -13,6 +13,9 @@ python-jose[cryptography]==3.3.0
 PyJWT==2.12.1
 bcrypt==4.2.1
 python-multipart==0.0.19  # form/file upload
+# Fernet 对称加密（platform_credentials access/refresh token 落库加密 - Track-01）
+# python-jose[cryptography] 已经间接依赖；这里显式声明便于审计 / pip-tools
+cryptography>=41
 
 # Config & validation
 pydantic==2.10.3
