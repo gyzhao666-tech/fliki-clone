@@ -55,10 +55,20 @@ def _run(coro):
 
 @pytest.fixture
 def admin_env(monkeypatch: pytest.MonkeyPatch) -> str:
-    """指定一个独立的 admin 邮箱，避免 demo fallback 与 case 顺序耦合。"""
+    """指定一个独立的 admin 邮箱，避免 demo fallback 与 case 顺序耦合。
+
+    Track-23 起 `_allowed_admins` 改读 `Settings.admin_emails`（pydantic-settings
+    在 ``Settings()`` __init__ 时一次性读 env），因此 ``monkeypatch.setenv`` 必须
+    搭配 ``get_settings.cache_clear()``，否则下次调用拿到的是旧缓存实例。
+    teardown 再清一次缓存恢复默认 demo fallback，避免污染下个 case。
+    """
+    from app.config import get_settings
+
     email = f"admin-{uuid.uuid4().hex[:6]}@pytest.local"
     monkeypatch.setenv("ADMIN_EMAILS", email)
-    return email
+    get_settings.cache_clear()
+    yield email
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -80,8 +90,15 @@ def temp_flag_tenant(pg_engine: Engine) -> Iterator[str]:
 
 
 def test_is_admin_email_default_demo(monkeypatch: pytest.MonkeyPatch):
-    """没配 ADMIN_EMAILS 时 demo@example.com fallback 命中（与 fixtures 一致）。"""
+    """没配 ADMIN_EMAILS 时 demo@example.com fallback 命中（与 fixtures 一致）。
+
+    Track-23 后：`Settings.admin_emails` 默认值即 "demo@example.com"，env 缺省
+    时即走 fallback；`get_settings.cache_clear()` 确保不被前面 case 缓存污染。
+    """
+    from app.config import get_settings
+
     monkeypatch.delenv("ADMIN_EMAILS", raising=False)
+    get_settings.cache_clear()
     from app.routers import admin_flags as af
 
     assert af._is_admin_email("demo@example.com") is True
@@ -89,17 +106,22 @@ def test_is_admin_email_default_demo(monkeypatch: pytest.MonkeyPatch):
     assert af._is_admin_email("not-admin@example.com") is False
     assert af._is_admin_email(None) is False
     assert af._is_admin_email("") is False
+    get_settings.cache_clear()
 
 
 def test_is_admin_email_env_overrides_default(monkeypatch: pytest.MonkeyPatch):
     """ADMIN_EMAILS 一旦配置，demo fallback 完全失效（不会同时命中）。"""
+    from app.config import get_settings
+
     monkeypatch.setenv("ADMIN_EMAILS", "alice@x.com, bob@y.com")
+    get_settings.cache_clear()
     from app.routers import admin_flags as af
 
     assert af._is_admin_email("alice@x.com") is True
     assert af._is_admin_email("bob@y.com") is True
     assert af._is_admin_email("BOB@y.com") is True
     assert af._is_admin_email("demo@example.com") is False  # fallback 被覆盖
+    get_settings.cache_clear()
 
 
 # ── 2. /me 端点 ──────────────────────────────────────────────────────────────

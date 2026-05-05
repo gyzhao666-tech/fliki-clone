@@ -9,17 +9,21 @@
 权限简化（v1）
 --------------
 按 backlog 卡片要求：`user.email in ALLOWED_ADMINS`。
-ALLOWED_ADMINS 来源（按优先级）：
-1. 环境变量 `ADMIN_EMAILS=foo@bar.com,baz@qux.com`（逗号分隔）
-2. fallback 内置默认（`demo@example.com` —— 与 fixtures 里的 demo user 一致，
-   方便本地直接测试；生产 env 必须显式覆盖）
+ALLOWED_ADMINS 来源（Track-23 起）：
+1. `Settings.admin_emails`（pydantic-settings 自动从 env `ADMIN_EMAILS`
+   注入，逗号分隔字符串）
+2. 解析后为空 → fallback 内置默认 `demo@example.com`（与 fixtures 里的
+   demo user 一致，方便本地直接测试；生产 env 必须显式覆盖）
 
-为什么不放 settings：Track-01 互斥锁占了 `app/config.py`；
-读 env 直读即可，避免越界改 config。后续可由协调者把它迁到 settings。
+迁移说明（Track-23）
+-------------------
+原 v1 实现 `os.environ.get("ADMIN_EMAILS", "")` 直读；Track-01 互斥锁解除后
+迁回 `app/config.py::Settings.admin_emails`，让 IDE 提示 / 全量 settings
+列表里有这一项，避免散落在多个 router 自己读 env。
 
 为什么不引入完整 RBAC：
 - v1 只需要"关掉灰度按钮的 self-serve 入口"
-- 完整 RBAC 是 L-05 长尾任务（workspace member editor/viewer）
+- 完整 RBAC 是 L-05 / Track-24 长尾任务（workspace member editor/viewer）
 
 为什么 tenant_id 是路径参数：
 - admin 操作的对象本来就是「某 tenant 的某 flag」，URL 自描述
@@ -28,7 +32,6 @@ ALLOWED_ADMINS 来源（按优先级）：
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -48,16 +51,20 @@ router = APIRouter(prefix="/admin/feature-flags", tags=["Admin / Feature Flags"]
 # ── admin 鉴权（简化版）─────────────────────────────────────────────────────
 
 
-def _allowed_admins() -> set[str]:
-    """读 env `ADMIN_EMAILS`（逗号分隔）；无则 fallback 到 demo@example.com。
+_FALLBACK_ADMIN_EMAIL = "demo@example.com"
 
-    注意保留 dev fallback：fixtures / 烟测里 demo user 的邮箱就是这个。
+
+def _allowed_admins() -> set[str]:
+    """读 `Settings.admin_emails`，按逗号 split + strip + lower + 去空 + set 化。
+
+    解析后为空（env 显式设为 ""）→ fallback {"demo@example.com"} 保留 dev
+    可用性：fixtures / 烟测里 demo user 的邮箱就是这个。
     """
-    raw = os.environ.get("ADMIN_EMAILS", "")
-    items = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    raw = get_settings().admin_emails or ""
+    items = {x.strip().lower() for x in raw.split(",") if x.strip()}
     if items:
-        return set(items)
-    return {"demo@example.com"}
+        return items
+    return {_FALLBACK_ADMIN_EMAIL}
 
 
 def _is_admin_email(email: Optional[str]) -> bool:
