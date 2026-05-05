@@ -57,17 +57,21 @@ fmt:
 	ruff format app/
 
 # ── Tests ─────────────────────────────────────────────
+# 用 venv 的 python 显式调 pytest，避免 PATH 上的系统 pytest 走用户级
+# site-packages 旧版（缺 pytest-asyncio）让所有 async case 误判为 sync 失败。
+PYTEST := .venv/bin/python -m pytest
+
 # 全套（unit + integration；缺 PG 时 integration 自动 skip 不挂红）
 test:
-	pytest tests/ -v
+	$(PYTEST) tests/ -v
 
 # 仅纯单元（不连 PG / 不调外部）；CI 默认门禁推荐用这条
 test-unit:
-	pytest tests/ -v -m unit
+	$(PYTEST) tests/ -v -m unit
 
 # 仅集成（需要本地 PG 跑过 alembic upgrade head）
 test-integration:
-	pytest tests/ -v -m integration
+	$(PYTEST) tests/ -v -m integration
 
 test-cov:
-	pytest tests/ -v --cov=app --cov-report=html
+	$(PYTEST) tests/ -v --cov=app --cov-report=html

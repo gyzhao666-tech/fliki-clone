@@ -472,6 +472,8 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
 
 ## 2.9 剩余可派任务（v1 工程闭环已收口；以下都是外部依赖 / 商务问题 / 长尾，可任意时机派）
 
+> 见下方 **2.9.1 第七波** —— 5 条已派发；以下 3 条仍在等外部 / 商务输入。
+
 ### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
 
 - 等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
@@ -485,25 +487,231 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
 
 - 等 MCN OpenAPI；技术骨架已在 `adapters/bilibili.py` 留好
 
+## 2.9.1 第七波 5 Track 派发（2026-05-05 16:40 创建 · v1 收口后第一波长尾并行）
+
+> **协调者注**：先修了 `Makefile::test` target（`pytest` → `.venv/bin/python -m pytest`），
+> 让 `make test` 真能 130 PASS（之前走系统 framework pytest 缺 `pytest-asyncio` 插件，
+> 55 个 async case 全被误判 sync 失败）。这条不属于任何 Track，已直接合 main。
+>
+> 第七波从长尾里挑 5 条互斥锁清晰、可并行的：
+>
+> | Track | 内容 | 工作量 | 互斥锁主战场 |
+> |---|---|---|---|
+> | 26 (L-02) | 卡拉 OK 字幕高亮 | 半天 | 前端 `pipeline/page.tsx::VoiceArtifact` 段 + 新 hook |
+> | 27 (L-14) | RBAC editor/viewer 实际写权限分级 | 1 天 | 后端 router 写端点 Depends 段 + 前端按钮 disable 段 |
+> | 28 (L-06) | Celery worker Docker + supervisor | 半天 | 仓库根新 `docker-compose.yml` + Dockerfile + Makefile docker-* target |
+> | 29 (L-07+08+09) | 3 个 ADR 文档（凭证 / 发布 SLA / 一致性演进） | 1 天 | 纯新文档（独立） |
+> | 30 (L-15) | workspace 切换 UI + 后端 list-my-workspaces 路由 | 半天 | 前端 sidebar **顶部**段 + 新 lib + 新 hook + 后端 `team.py` 加 GET 路由 |
+>
+> **冲突预警**：T-27 和 T-30 都会动 `sidebar.tsx`，但分区明确：
+> - T-30 改的是 sidebar **顶部 logo 之下**（新 `<WorkspaceSelector/>` dropdown）；
+>   不动 admin links 段（行 `127-145`）
+> - T-27 改的是 admin links 段 + `lib/admin-flags.ts::getAdminMe` schema 扩 `role`
+>   字段；不动顶部
+>
+> 协调者合并顺序建议：T-29（独立文档零冲突）→ T-28（独立 Docker）→ T-26（独立前端 VoiceArtifact）
+> → T-30（sidebar 顶部 + lib/workspaces.ts + 后端 team.py）→ T-27（最后合，吸收
+> sidebar admin links 段 + admin-flags.ts schema 扩展，与 T-30 sidebar 顶部段
+> git auto-merge 应通过）。
+
+### Track-26 · L-02 卡拉 OK 字幕高亮 ★ (半天)
+
+- **分支**：`track-26-karaoke-highlight`（待协调者创建）
+- **依赖**：✅ Track-04 (VoiceAgent v4 word-level outputs.subtitles[].words[{start,end,word}] 已落地)
+- **目标**：VoiceArtifact 已经渲染出每条字幕的 word 时间轴卡片，但只是静态展示。
+  让前端监听 audio 元素的 `timeupdate`，根据当前 `audio.currentTime` 在
+  `subtitle.words` 数组中二分查找当前 word index，加 violet bg + scale 动画，
+  实现卡拉 OK 视觉效果。
+- **修改文件**：
+  - **新 hook** `fliki-clone/src/hooks/use-audio-current-word.ts`：
+    - 入参：`audioRef: RefObject<HTMLAudioElement>` + `subtitles: Array<{start,end,words?:Array<{start,end,word}>}>`
+    - 内部：`useEffect` 注册 `timeupdate` listener（节流 ≤ 33ms / 30fps），
+      当前时间二分查找命中的 (subtitleIndex, wordIndex)；返 `{currentSubtitleIndex, currentWordIndex}`
+    - 边界：currentTime 在所有 words 之外返 `(-1, -1)`；audio paused 也持续返当前位置
+  - `fliki-clone/src/app/[locale]/(app)/app/project/[id]/pipeline/page.tsx::VoiceArtifact`（行号约 1690-1900 段）：
+    - audio 元素加 `ref={audioRef}` + `onPlay/onPause` 控制 hook enabled
+    - 字幕条循环渲染时（约行 1819-1880）：
+      - 字幕 wrapper 加 `data-subtitle-index={i}`；命中 `currentSubtitleIndex` 时整条加 sky-50 bg
+      - word span 循环（约行 1854-1862）：命中 `currentWordIndex` 时 word 加 `bg-violet-500 text-white`，
+        其它 word 维持原状；用 `transition-colors duration-150` 平滑过渡
+    - 顶部状态徽标加一条「卡拉 OK 实时高亮 ✓」（仅 v4 word-level 字幕场景显示）
+- **互斥锁（独占）**：
+  - 新 hook 文件 `use-audio-current-word.ts`（独占）
+  - `pipeline/page.tsx::VoiceArtifact` 段（行 1690-1900；与 ArtArtifact / VideoArtifact / EditArtifact / PlanRow / ProductionPanel / 其它顶层段无冲突）
+- **不做**：autoplay / 字幕条点击跳转 audio.currentTime（留给后续 polish）；非 word-level 字幕（v3 行级）的高亮（v3 没 word，没法做卡拉 OK）
+- **烟测**：
+  - jest/vitest 单测（新 `tests/use-audio-current-word.test.ts`）：构造假 subtitles 数组 + 模拟 audio currentTime 推进 → 断言 currentSubtitleIndex / currentWordIndex 单调推进 + 边界返 -1
+  - 手测（不强制）：浏览器拉一个 v4 字幕的 run，点 play 看高亮跟着 audio 走
+
+### Track-27 · L-14 RBAC editor/viewer 实际写权限分级 ★★ (1 天)
+
+- **分支**：`track-27-rbac-editor-viewer`（待协调者创建）
+- **依赖**：✅ Track-24 (services/auth/rbac.py + team_members.role 列已落地；本 Track 在其上扩 editor/viewer 语义)
+- **目标**：T-24 已经写了 `is_admin(user_id, *, workspace_id, email)`，但全仓库只用了「admin vs 非 admin」二元判断。
+  本 Track 把 role 真接到写操作鉴权：admin 可改 billing；admin/editor 可创建/修改/删除 versions/publish_plans + 启 pipeline + 执行 publish；
+  viewer 仅读。前端按钮按 role disable + tooltip。
+- **修改文件**：
+  - **后端** `app/services/auth/rbac.py` 扩展（不动 is_admin / get_user_role 既有签名）：
+    - 加 `is_editor(user_id, *, workspace_id=None) -> bool`：role in ("admin", "editor")，命中规则同 is_admin（显式 workspace → 任意 workspace 兜底；**不**走邮箱 fallback，editor 必须真在 team_members）
+    - 加 `is_viewer(user_id, *, workspace_id=None) -> bool`：role 非空即 True（admin/editor/viewer 都可读）
+    - 加 `require_role(allowed: list[str])` FastAPI Depends factory：返 `Depends(_check)`，未命中抛 403 `{"detail": "需要 admin/editor 权限"}` 等带 role 的中文消息；admin 走 fallback 邮箱白名单仍命中
+  - **后端 router 写端点加 Depends**（**不**改既有签名，仅在路由 decorator 加 `dependencies=[require_role(["admin","editor"])]` 或 函数签名最后加 `_=Depends(require_role(...))`）：
+    - `routers/production.py`：`POST /publish-plans` / `PATCH /publish-plans/{id}` / `DELETE /publish-plans/{id}` / `POST /publish-plans/{id}/execute` / `POST /versions` / `POST /versions/{id}/publish` / `DELETE /versions/{id}` → require_role(["admin","editor"])
+    - `routers/pipelines.py`：`POST /pipelines` (start) / `POST /pipelines/{id}/cancel` / `POST /pipelines/{id}/tick` / `POST /pipelines/{id}/steps/{name}/rerun` / `POST /pipelines/{id}/steps/{name}/approve` → require_role(["admin","editor"])
+    - `routers/billing.py`：`POST /billing/checkout-session` / `POST /billing/portal-session` → require_role(["admin"])（计费操作 admin 唯一）
+    - `routers/admin_flags.py`：既有 `_require_admin` 已经做这个，确保对齐到新的 require_role(["admin"])（**不**改 _require_admin 内部，让既有 7 case 保持 PASS）
+  - **后端** 新 `app/routers/auth.py` 加（或扩既有 me 端点）：`GET /me/role?workspace_id=` → 返 `{role: "admin"|"editor"|"viewer"|null, is_admin, is_editor, is_viewer, email}`，让前端能批量探测
+  - **前端** `lib/admin-flags.ts::AdminMeOut` 扩 schema：加 `role: string|null` / `is_editor: boolean` / `is_viewer: boolean`（与后端 GET /admin/feature-flags/me 保持兼容；后端 admin_flags.py /me 也要顺手加这三字段）
+  - **前端** 新 `lib/role.ts` + `use-current-role.ts`：薄封装 admin-flags.getAdminMe；export `useCurrentRole(): {role, isAdmin, isEditor, isViewer, loading}`
+  - **前端按钮 disable**（按 role 灰化 + tooltip "需要 admin/editor 权限"）：
+    - `pipeline/page.tsx::ProductionPanel` 内的「另存为版本」/「新建发布计划」/「删除」按钮 → viewer disable
+    - `pipeline/page.tsx::PlanRow` 的「执行」按钮 → viewer disable
+    - `pipeline/page.tsx` 顶部「启动」按钮 → viewer disable
+    - 新 `app/billing/page.tsx::UpgradeButton` → 非 admin disable
+- **互斥锁（独占）**：
+  - 后端：`services/auth/rbac.py` 末尾加新函数（不改既有签名）；4 个 router 写端点 decorator 加 dependencies；新 `routers/auth.py::GET /me/role`（如果 routers/auth.py 太大新建 `routers/me.py` 也行）；`routers/admin_flags.py::/me` 端点 schema 扩三字段
+  - 前端：`lib/admin-flags.ts::AdminMeOut` schema 扩三字段；新 `lib/role.ts` + `use-current-role.ts`；按钮 disable 段（独立控制 disabled prop，不动按钮其它逻辑）
+  - **与 T-30 互斥**：T-30 不会动 router 写端点 / role 判定 / admin-flags schema；T-30 只新加 `GET /api/team/workspaces/me` + `lib/workspaces.ts` + sidebar 顶部段。两者并行不冲突。
+- **不做**：role 编辑 UI（admin 改 member.role 已经在 `routers/team.py::PATCH /team/members/{id}` 里，不动）；workspace 切换让 role 跟着 workspace 切（让 T-30 落 workspace 选择后再做联动；本批 use-current-role 仅探当前默认 workspace）
+- **烟测**：
+  - 单元：`tests/test_track27_rbac_role.py`（新文件）覆盖 `is_editor` / `is_viewer` / `require_role` 三函数 ≥ 8 case：viewer 调写端点 403、editor 调 admin-only 端点 403、admin 全通过、邮箱白名单兜底仅对 admin 生效不对 editor、role=None 拒绝
+  - 集成：mock `current_user` role=editor → POST /publish-plans 返 200；role=viewer → 403 + detail 含「editor」
+  - 跑全量 `make test` 验证既有 130 case 仍 PASS（关键：`_require_admin` 在 fixture 里走的是 `is_admin("demo@example.com", email=...)` → 邮箱白名单 fallback 仍命中）
+
+### Track-28 · L-06 Celery worker Docker + supervisor ★ (半天)
+
+- **分支**：`track-28-celery-docker`（待协调者创建）
+- **依赖**：无（独立 ops 工作）
+- **目标**：当前 backend / celery worker / 前端都靠手动 `make pipeline-worker` / `npm run dev` 起；
+  写一份 `docker-compose.yml` 让单机部署可一键 `docker compose up`：postgres + redis + backend + frontend + celery worker（pipeline 三队列）+ celery beat（如果需要）。
+- **修改文件**：
+  - **新** `fliki-clone-api/Dockerfile`：
+    - 基于 `python:3.10-slim`
+    - 装 ffmpeg（apt-get install）+ requirements.txt + requirements-dev.txt
+    - WORKDIR /app + COPY app/ alembic/ alembic.ini Makefile
+    - 默认 CMD `uvicorn app.main:app --host 0.0.0.0 --port 8000`（不带 --reload）
+  - **新** `fliki-clone/Dockerfile`：
+    - 基于 `node:20-alpine`
+    - 装 deps + COPY src/ public/ next.config.* tsconfig.json
+    - `npm run build` + 默认 CMD `npm run start`
+  - **新** `docker-compose.yml`（仓库根，与 fliki-clone-api 同级）：
+    ```yaml
+    services:
+      postgres: image postgres:15 + healthcheck pg_isready
+      redis:    image redis:7-alpine + healthcheck redis-cli ping
+      backend:  build ./fliki-clone-api + depends_on postgres+redis healthy + env DATABASE_URL_SYNC / CELERY_BROKER_URL / SILICONFLOW_API_KEY 等从 .env 透传 + restart unless-stopped
+      worker:   build ./fliki-clone-api + command celery -A app.services.pipeline.celery_app worker -Q interactive,media,default --concurrency=2 --loglevel=info + depends_on backend healthy + restart unless-stopped
+      frontend: build ./fliki-clone + depends_on backend healthy + env NEXT_PUBLIC_API_URL=http://backend:8000 + restart unless-stopped
+    volumes:
+      postgres_data:
+    ```
+  - **新** `.dockerignore`（仓库根）：忽略 .venv / node_modules / .git / .env / __pycache__ 等
+  - `Makefile`（fliki-clone-api 内）末尾加：`docker-up`（从仓库根调 docker compose up）/ `docker-down` / `docker-logs` / `docker-rebuild` target
+  - **新** `docs/deployment.md`：单机 docker 部署快速指南（前置：装 docker / .env 配关键 key / `docker compose up -d` / 端到端验证）
+- **互斥锁（独占）**：
+  - 新 Dockerfile × 2（独占）
+  - 新 docker-compose.yml（独占）
+  - 新 .dockerignore（独占）
+  - Makefile 末尾追加 docker-* target（与既有 test target 不冲突；T-29 改的是 docs/，与本 Track 不冲突）
+  - 新 docs/deployment.md（独占）
+- **不做**：k8s helm chart（出生产部署再说）；secrets 管理（.env 直接 mount，生产用 docker secret 留待真上线）；CI 跑 docker build（CI 一起做）；postgres data 持久化高级配置（默认 named volume 够用）
+- **烟测**：
+  - `docker compose config` 验证 yaml 合法
+  - `docker compose build` 至少完成（不需要真 up，本地 docker 起 PG 5 分钟太慢）
+  - 写 NOTES 时附 `docker compose config` 输出片段证明合法
+
+### Track-29 · L-07+08+09 ADR 文档三连 ★ (1 天)
+
+- **分支**：`track-29-adr-docs`（待协调者创建）
+- **依赖**：无（纯文档）
+- **目标**：把 v1 收口前的几个关键工程决策固化成 ADR：凭证加密 / 多平台发布 SLA / 角色一致性演进。后续做改动有 reference。
+- **修改文件**（**全部新文件，零冲突**）：
+  - **新** `fliki-clone-api/docs/adr/003-credentials-encryption.md`：
+    - 标题：「ADR-003：发布平台凭证加密策略」
+    - Context：Track-01 落 Fernet 加密；KEY 缺失时降级 plain text + warning
+    - Decision：单 Fernet KEY（`PUBLISH_CREDENTIAL_FERNET_KEY` env）；KEY 缺失静默 plain text + log warning（dev 友好）；future rotation 走多 KEY 兼容（`MultiFernet`）
+    - Alternatives：KMS（生产部署再考虑；本地开发依赖太重）/ AES-GCM 自签 nonce（reinvent）/ 不加密（v0 状态）
+    - Consequences：dev 不需要任何配置；prod 上线必须配 KEY；rotation 时新加 KEY 到列表头继续解旧密文
+    - 引用：`app/services/publishing/credentials.py` / `scripts/migrate_encrypt_creds.py`
+  - **新** `fliki-clone-api/docs/adr/004-multi-platform-publish-sla.md`：
+    - 标题：「ADR-004：多平台发布执行器 SLA 与重试策略」
+    - Context：Track-02/03/13/15 共同搭出的 publish 执行器；YouTube 真发 chunked PUT + DLQ 路由
+    - Decision 矩阵（每平台一段）：
+      - dry_run：始终启用 100% SLA；返 mock external_id；不入 DLQ
+      - youtube：8 MiB chunked PUT + 单片 5xx/408/429 指数退避 1s/2s/4s 最多 3 次；4xx 立即抛 PublishError 入 DLQ；安全闸门 confirm_real_publish=false 拒绝真发；DLQ retry 通过 task_name 路由回 execute_publish_plan_task
+      - bilibili：v1 stub（无 OpenAPI），引导手动上传，不入 DLQ；待 MCN 入驻补真适配
+    - 重试策略：DLQ 仅 pending 可 retry；retry 走 `_retry_dispatch` 按 task_name 分发；celery 模式走 `execute_publish_plan_task.apply_async`，BG 模式走 `_publish_execute_with_events`
+    - 凭证生命周期：YouTube OAuth refresh_token 长期有效；access_token 1h 过期，adapter 调用前自动 refresh；refresh 失败抛 PublishError 引导用户重新 OAuth
+    - Consequences：未来加 TikTok / Instagram 走同 protocol；SLA 矩阵跟着加一行
+  - **新** `fliki-clone-api/docs/adr/005-character-consistency-evolution.md`：
+    - 标题：「ADR-005：ArtAgent 角色一致性 v3 → v4 → v5 → LoRA 演进」
+    - Context：v2 每镜独立出图，主角形象漂移；引入 v3 prompt-only / v4 IP-Adapter / v5 多角色 anchor + canary（Track-09/10）
+    - Decision：演进三阶段
+      - v3（已落）：`_inject_consistency_into_shots` 把 `[Consistent character: protagonist=...]` 注入 enhanced_prompt；negative_prompt 加防漂关键词
+      - v4（已落）：`character_anchor.url` 喂 image provider（IP-Adapter）；不支持时剥离 `image_url` 重试同模型
+      - v5（已落）：每个 character_card 各一份 anchor + 按 `shot.focus_character` 逐镜选；canary feature_flag 染色 v4 ↔ v3-prompt-only
+      - v6（外部依赖待启）：等 SiliconFlow Kolors-IP / Replicate Flux Redux 真 multi-IP 端点；当前 anchors_by_role 接入点已留
+      - 远期（M+）：训练每角色 LoRA（用 anchor 做训练集 1k+ 样本）；LoRA 权重存 `character_cards.lora_weight_url`；inference 时按 focus_character 切 LoRA
+    - Tradeoffs：Prompt 注入（便宜 / 漂移大）vs IP-Adapter（中等 / 单角色稳）vs LoRA（贵一次 / 多角色稳 / 需训练数据）
+    - Consequences：当前 v5 是商业可用基线；v6 接入待外部；LoRA 是远期路线，工程预留 `character_cards` 表 schema
+- **互斥锁（独占）**：
+  - 全部新文件，零冲突
+- **不做**：改 docs/adr/001-002（已落地不动）；改任何业务代码
+- **烟测**：
+  - `markdownlint docs/adr/00[3-5]-*.md`（如果仓库有 lint 配置）；否则手测每文件 `head -10` 确认有标题/Context/Decision/Consequences 四段
+
+### Track-30 · L-15 workspace 切换 UI + 后端 list-my-workspaces 路由 ★ (半天)
+
+- **分支**：`track-30-workspace-switcher`（待协调者创建）
+- **依赖**：✅ Track-24（rbac.get_user_role 已落地，本 Track 复用）
+- **目标**：当前所有 user 默认走 `_get_or_create_workspace(user.id)` 拿到 own workspace；user 在多个 workspace
+  里时只能用第一个有权限的，没法显式切。本 Track 加：(1) 后端 `GET /api/team/workspaces/me` 列当前 user 所有
+  workspace + 每个 role；(2) 前端 sidebar 顶部 workspace selector dropdown + Context Provider 全局可用；(3) 切换后
+  把 workspace_id 存 localStorage + Cookie（或 query param）让后端读 workspace 上下文。
+- **修改文件**：
+  - **后端** `routers/team.py` 加 `GET /api/team/workspaces/me`：返 `{workspaces: [{id, name, role, is_owner, created_at}]}`，
+    用 `team_members LEFT JOIN workspaces` 拉当前 user 在的所有 workspace + 自己 own 的（owner 没 team_members 行也要算 admin）。
+    复用 `app.services.auth.rbac.get_user_role` 拿 role；owner 自动 role=admin（与 T-24 backfill 一致）
+  - **前端** 新 `lib/workspaces.ts`：
+    - 类型 `WorkspaceMembership { id, name, role, is_owner, created_at }`
+    - `listMyWorkspaces() -> Promise<{workspaces: WorkspaceMembership[]}>` 调 GET /api/team/workspaces/me
+  - **前端** 新 `hooks/use-current-workspace.ts`：
+    - Context Provider `<WorkspaceProvider>` 包子树
+    - `useCurrentWorkspace()` 返 `{current, list, switch(id), loading, refresh}`
+    - localStorage key `fliki:current-workspace-id` 持久化；首次加载时 = 列表第一个
+    - 切换时 setState + write localStorage + 触发 query refetch（可选 emit 自定义事件让 SSE / queries 知道）
+  - **前端** `app/[locale]/(app)/layout.tsx`：把 `<WorkspaceProvider>` 包在 `<UserEventsListener>` 之外（最外层），让 sidebar / 子页面都能用
+  - **前端** `components/app-shell/sidebar.tsx`：在顶部 logo 之下（行 100-106 段下方）加 `<WorkspaceSelector />` —— shadcn `<Select>` 或自定义 dropdown，列 workspaces + 当前选中 + role badge（admin 紫 / editor sky / viewer slate）
+  - **新** `components/app-shell/workspace-selector.tsx`：薄封装 useCurrentWorkspace + dropdown UI
+- **互斥锁（独占）**：
+  - 后端 `routers/team.py` 末尾加新路由（不改既有 4 端点）
+  - 前端新文件：lib/workspaces.ts / hooks/use-current-workspace.ts / components/app-shell/workspace-selector.tsx
+  - `(app)/layout.tsx` 加 Provider wrap（小段独占；T-25 加的 UserEventsListener 不动；本 Track 把 Provider 作为最外层）
+  - `components/app-shell/sidebar.tsx`：仅顶部段（行 100-106 之间插入 WorkspaceSelector）；**不动** admin links 段（行 127-145）让 T-27 安全
+- **不做**：workspace 切换后所有 queries 的真实 invalidate（让 hook emit 事件，page 自己监听；本批不强制每页改）；workspace 创建 / 删除 UI（已有 settings/team 入口）；多租户隔离的真 API guard（_get_or_create_workspace 仍按 owner 兜底，不本批改）
+- **烟测**：
+  - 后端单元（新 `tests/test_track30_workspaces.py`）：seed 1 user own 1 workspace + member 另 1 workspace → GET /api/team/workspaces/me 应返 2 条，own 的 role=admin（owner 兜底）/ member 的 role=team_members 真值
+  - 前端：手测打开 sidebar 看 selector 渲染；切换不报错；localStorage 写入正确 key
+
 ## 3. 长尾（任意时机）
 
 | ID | 任务 | 工作量 |
 |---|---|---|
 | L-01 | 字幕翻译 + 多语言版本 | 1 天 |
-| L-02 | 卡拉 OK 高亮联动 audio.timeupdate | 半天 |
+| ~~L-02~~ → T-26 | ~~卡拉 OK 高亮联动 audio.timeupdate~~ → 第七波派发中 | ~~半天~~ |
 | ~~L-03~~ → T-21 | ~~metric dashboard 时序~~ → 第五波已 done | ~~1.5 天~~ |
 | ~~L-04~~ → T-22 | ~~月账单 PDF + 邮件~~ → 第五波已 done | ~~1 天~~ |
 | ~~L-05~~ → T-24 | ~~RBAC workspace member~~ → 第六波已 done | ~~1.5 天~~ |
-| L-06 | Celery worker Docker + supervisor | 半天 |
-| L-07 | ADR-003 凭证加密策略 | 0.5 天 |
-| L-08 | ADR-004 多平台发布 SLA | 0.5 天 |
-| L-09 | ADR-005 角色一致性 v3→v4→v5→LoRA 演进 | 0.5 天 |
+| ~~L-06~~ → T-28 | ~~Celery worker Docker + supervisor~~ → 第七波派发中 | ~~半天~~ |
+| ~~L-07~~ → T-29 | ~~ADR-003 凭证加密策略~~ → 第七波派发中（合 T-29 三连）| ~~0.5 天~~ |
+| ~~L-08~~ → T-29 | ~~ADR-004 多平台发布 SLA~~ → 第七波派发中（合 T-29 三连）| ~~0.5 天~~ |
+| ~~L-09~~ → T-29 | ~~ADR-005 角色一致性 v3→v4→v5→LoRA 演进~~ → 第七波派发中（合 T-29 三连）| ~~0.5 天~~ |
 | ~~L-10~~ → T-25 | ~~配额超限 SSE 实时推送~~ → 第五波已 done | ~~半天~~ |
 | ~~L-11~~ → T-18 | ~~model_calls 加 tenant_id~~ → 第四波已 done | ~~半天~~ |
 | L-12 | 前端 i18n 完整覆盖 | 1.5 天 |
 | ~~L-13~~ → T-23 | ~~ADMIN_EMAILS 迁 Settings~~ → 第五波已 done | ~~0.5 天~~ |
-| L-14 | RBAC editor/viewer 实际权限分级（T-24 follow-up）| 1 天 |
-| L-15 | workspace 切换 UI（让 user 显式选 workspace）| 半天 |
+| ~~L-14~~ → T-27 | ~~RBAC editor/viewer 实际权限分级（T-24 follow-up）~~ → 第七波派发中 | ~~1 天~~ |
+| ~~L-15~~ → T-30 | ~~workspace 切换 UI（让 user 显式选 workspace）~~ → 第七波派发中 | ~~半天~~ |
 
 ## 4. 给单个 Cursor Agent Window 的标准开工提示词
 
