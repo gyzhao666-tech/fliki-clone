@@ -29,6 +29,12 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_endpoint: str = ""
 
+    # Admin（Track-23）
+    # 逗号分隔的 admin 邮箱白名单；admin_flags.py / cost.py 通过 _is_admin_email 命中。
+    # 缺省 "demo@example.com" 与 fixtures 里的 demo user 一致，开箱可测；生产 env
+    # 显式覆盖为真实运维邮箱。pydantic-settings 自动从 env ADMIN_EMAILS 注入。
+    admin_emails: str = "demo@example.com"
+
     # Stripe（Track-11）
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
