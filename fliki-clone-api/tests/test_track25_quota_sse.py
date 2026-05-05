@@ -36,6 +36,35 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+# ── 路由顺序回归（修复 2026-05-05 19:35 发现的 404 bug）────────────────────
+# /user-events 必须在 /{run_id} 之前注册，否则 FastAPI 按顺序匹配会让前者被
+# 后者吞掉（GET /user-events → run_id="user-events" → DB 不存在 → 404）。
+# T-25 agent 当时把 handler 加在文件末尾，FastAPI 按声明顺序注册路由就踩坑。
+
+def test_user_events_registered_before_run_id_route():
+    """openapi.json 路径列表里 `/pipelines/user-events` 必须存在且独立于
+    `/pipelines/{run_id}`；如果路由顺序错了，user-events 会被 run_id 吃掉
+    （openapi 还会显示存在，但运行时 404，所以这里附加 router.routes 顺序断言）。
+    """
+    from app.routers.pipelines import router
+
+    # 收集 path -> 在 router.routes 中的 index
+    path_index: dict[str, int] = {}
+    for i, route in enumerate(router.routes):
+        path = getattr(route, "path", None)
+        if path and path not in path_index:
+            path_index[path] = i
+    # router 自带 prefix=/pipelines；route.path 是带 prefix 的完整路径
+    ue = "/pipelines/user-events"
+    rid = "/pipelines/{run_id}"
+    assert ue in path_index, f"{ue} 路由没注册：{sorted(path_index.keys())}"
+    assert rid in path_index, f"{rid} 路由没注册：{sorted(path_index.keys())}"
+    assert path_index[ue] < path_index[rid], (
+        f"{ue} 必须在 {rid} 之前注册，否则会被 path-param 吞成 404；"
+        f"当前 user-events 在 #{path_index[ue]}，run_id 在 #{path_index[rid]}"
+    )
+
+
 # ── 1. publish_user_event channel routing ────────────────────────────────────
 
 

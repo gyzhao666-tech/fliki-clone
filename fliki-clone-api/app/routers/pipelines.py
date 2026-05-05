@@ -393,6 +393,48 @@ def _quota_to_out(
     )
 
 
+# ⚠️ /user-events 必须在 /{run_id} 之前注册（FastAPI 按声明顺序匹配；
+# 否则 GET /user-events 会被 /{run_id} 吞掉，把 "user-events" 当 run_id 查 DB → 404）。
+# helpers `_user_snapshot_payload` / `_user_events_sse_stream` 在文件后面定义，
+# Python module 加载完所有 def 都在，handler 运行时才会调用，定义顺序无所谓。
+@router.get("/user-events")
+async def user_events_stream(
+    current_user: CurrentUser,
+    request: Request,
+):
+    """订阅当前登录用户的事件流（quota_exceeded / bucket_full）。
+
+    全局 layout.tsx 挂 hook 即可监听，所有页面都能收到 toast；不需要每个
+    pipeline 页面单独订阅。
+    """
+
+    tctx = pipeline_tenant.resolve_tenant_context(
+        current_user.id, user_plan=getattr(current_user, "plan", None) or "free"
+    )
+    snap = get_or_create_tenant(
+        tctx.tenant_id, plan=tctx.plan, display_name=tctx.display_name
+    )
+    active = count_active_runs_tenant(tctx.tenant_id)
+    buckets = pipeline_buckets.list_buckets(tctx.tenant_id)
+    snapshot_payload = _user_snapshot_payload(current_user, tctx, snap, active, buckets)
+
+    last_event_id = request.headers.get("Last-Event-ID") or None
+    return StreamingResponse(
+        _user_events_sse_stream(
+            current_user.id,
+            request,
+            snapshot_payload,
+            last_event_id=last_event_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
 @router.get("/{run_id}", response_model=RunOut)
 async def get_pipeline(run_id: str, current_user: CurrentUser) -> RunOut:
     _ensure_run_owner(run_id, current_user.id)
@@ -788,44 +830,6 @@ async def _user_events_sse_stream(
             await sub_iter.aclose()  # type: ignore[attr-defined]
         except Exception:
             pass
-
-
-@router.get("/user-events")
-async def user_events_stream(
-    current_user: CurrentUser,
-    request: Request,
-):
-    """订阅当前登录用户的事件流（quota_exceeded / bucket_full）。
-
-    全局 layout.tsx 挂 hook 即可监听，所有页面都能收到 toast；不需要每个
-    pipeline 页面单独订阅。
-    """
-
-    tctx = pipeline_tenant.resolve_tenant_context(
-        current_user.id, user_plan=getattr(current_user, "plan", None) or "free"
-    )
-    snap = get_or_create_tenant(
-        tctx.tenant_id, plan=tctx.plan, display_name=tctx.display_name
-    )
-    active = count_active_runs_tenant(tctx.tenant_id)
-    buckets = pipeline_buckets.list_buckets(tctx.tenant_id)
-    snapshot_payload = _user_snapshot_payload(current_user, tctx, snap, active, buckets)
-
-    last_event_id = request.headers.get("Last-Event-ID") or None
-    return StreamingResponse(
-        _user_events_sse_stream(
-            current_user.id,
-            request,
-            snapshot_payload,
-            last_event_id=last_event_id,
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
 
 
 # 触发 execute_step 名称导出，便于 Phase 2 切到 Celery 时 import
