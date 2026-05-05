@@ -1,7 +1,21 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 并行第一波 7 Track + 第二波 4 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 第一波 7 Track + 第二波 4 Track + 第三波 5 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 14:30 更新：**多 Agent 第三波 5 Track 已合并到 main**（`pytest 79/79 PASS`）。
+> 合并顺序：T-15 → T-14 → T-13 → T-17 → T-16（T-17 vs T-13 在 use-publish-plan-stream.ts 顶部 docstring 段一处冲突，已手解保留双方协议描述）。
+> 新 alembic head: **`b2c3d4e5f6a7`**（顶 `a1b2c3d4e5f6`，`subscriptions.refunded_at` 列）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 13 YouTube chunked PUT + 进度回写 SSE | YouTube adapter 删 v1 multipart 一把发；改成 8 MiB 分片 chunked PUT；每片 5xx/408/429 指数退避重试 3 次；`progress_cb` 每片调用一次 → executor 闭包 read-modify-write `publish_plans.meta_json.upload_progress` + `publish_plan_event(plan_id, "upload_progress", info)` 推 SSE；前端新 `<UploadProgressBar>`（下载灰 / 上传 sky）+ `latestProgress` state | `adapters/youtube.py` 重写 + `adapters/base.py` `progress_cb` 字段 + `executor.py` `_make_progress_cb` + `use-publish-plan-stream.ts` `addEventListener("upload_progress")` + `pipeline/page.tsx::PlanRow` 进度条段 + 8 case 协议层 mock 单测 |
+> | 14 Admin Feature Flags UI | 后端 `routers/admin_flags.py` 抽 `_is_admin_email`；新加 `GET /me`（任何登录用户可调返 `{is_admin, email}` 让前端探测）+ `GET /tenants`（按 tenant_id 聚合 + flag_count）；新前端 `app/admin/feature-flags/page.tsx`（968 行 tenant 选择器 + 表格 + pct 滑块 / toggle / variant 下拉自适应 + Apply/Delete + 新增 dialog）+ `lib/admin-flags.ts` + `sidebar.tsx` admin 入口 | 7 case 单测覆盖白名单 / `_require_admin` 403 / `/me` / `/tenants` / CRUD round-trip。**注**：agent 完成代码 + 测试但忘 commit + NOTES，协调者 `git add -A` 收口 + 代写 NOTES |
+> | 15 DLQ retry 按 task_name 路由 | `routers/dlq.py::_retry_dispatch` 识别 `task_name="publish.execute_plan"` 改派 `execute_publish_plan_task`（celery）/ `_publish_execute_with_events`（BG fallback）；顺手修隐藏 bug：旧版 `if not run_id: 400` 让 publish DLQ 死锁（`publish_plans` 与 `pipeline_runs` 没外键，task 没 `run_id`） | `routers/dlq.py` 加 task_name 分支 + 7 case 单测覆盖 celery / BG / args 解析 / 兜底 task_name=tick / 已 retried 拒绝 |
+> | 16 Stripe webhook charge.refunded + 6 case 单测 | alembic `b2c3d4e5f6a7` 顶 `a1b2c3d4e5f6`，加 `subscriptions.refunded_at TIMESTAMPTZ NULL`（不加 server_default 避免老行误打标 / 不加索引）；`webhook_handlers.py` 加 `_handle_charge_refunded`：`metadata.subscription_id` → `customer` 反查最新订阅；都不命中返 `{handled:True, matched:0}`；**只打标 refunded_at**，不动 `tenant_quotas` / `users.plan` / `subscriptions.plan`（v1 用户体验优先；ops 评估后人手降级）；6 case 端到端覆盖 5 类 stripe 事件 + unknown | `alembic/versions/20260505_1500_add_subscription_refunded_at.py` + `models/billing.py::Subscription` 加列 + `services/billing/webhook_handlers.py` 加 handler + 新 `tests/test_billing_webhook.py` |
+> | 17 SSE 断网重连 last_event_id | `services/pipeline/events.py` 升级为 redis Stream + pub/sub 双写：`_publish_to_channel` 加 `XADD {channel}:stream * data <json>`（MAXLEN ~1000 approximate trim）；`_subscribe_channel` 改用 `xread({stream: cursor}, block=1000)`；yield 升级 3-tuple 带 `entry_id`；XADD 失败不阻塞 PUBLISH；`_sse_format(event, data, event_id=None)` 非空时 emit `id:` 行；两个 SSE 端点从 `Last-Event-ID` 头透传 cursor → 浏览器 EventSource 自动续传 | `events.py` 重写 + `routers/{pipelines,production}.py::_sse_format` + 两个前端 hook + 10 case 单测（XADD 双写 / 失败兜底 / cursor 推进 / id 单调 / redis ping 失败 noop） |
+>
+> **整体能力扩展**：YouTube 1080p+ 真发不再卡 60s timeout（chunked PUT + 进度条 UI）；DLQ retry 真能重投 publish 任务（修了「按钮点不动 + 静默 retried 误导审计」的 bug）；Admin Feature Flags 可视化（不再 curl）；Stripe 退款事件全闭环；SSE 断网重连续传不丢中间事件。
 
 > 2026-05-05 13:55 更新：**多 Agent 第二波 4 Track 已合并到 main**（`pytest 41/41 PASS`）。
 > 合并顺序：T11 → T03 → T09 → T10（最后合 T10 解 art.py canary × 多角色叠加冲突）。
@@ -101,28 +115,27 @@
 
 ## 2026-05-05 当前进程（最新）
 
-- **后端 pid 30876**（仍在 11:13 启的进程；监听 `127.0.0.1:8000`，无 proxy 污染；
-  代码改了未重启 → **下次重启就会加载第二波 4 Track 新代码 + alembic head `a1b2c3d4e5f6`**；
-  已落库的能力：配额 v2 / VoiceAgent v4 / ArtAgent v3+v4 IP-Adapter / 发布执行器 v1
-  含 confirm_real_publish 列 / faster-whisper 本地 fallback / Fernet 凭证加密）
-- **前端 pid 8947**（next dev，3000 端口，hot-reload 改动无需重启；
-  第二波 4 Track 的前端改动会自动 hot-reload）
+- **后端 pid 30876**（仍在 11:13 启的旧进程；监听 `127.0.0.1:8000`，无 proxy 污染；
+  代码改了未重启 → **下次重启会加载第二波 + 第三波 9 条 Track 新代码 + alembic head `b2c3d4e5f6a7`**）
+- **前端 pid 8947**（next dev，3000 端口，hot-reload 自动生效；
+  第三波前端改动（admin 面板 / 进度条 / SSE last-event-id）已 hot-reload）
 
-**第二波合并后必做**：
+**第三波合并后必做**：
 
 ```bash
 # 1. 停旧 backend（pid 30876）
 kill 30876
 
-# 2. 跑 alembic（如果你跨过 12:35 没启过新 backend，就把 feature_flags 迁移落库）
+# 2. 跑 alembic（落第二+三波两条新迁移：feature_flags 表 + subscriptions.refunded_at 列）
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
-  .venv/bin/python -m alembic upgrade head   # → a1b2c3d4e5f6
+  .venv/bin/python -m alembic upgrade head   # → b2c3d4e5f6a7
 
 # 3. 启新 backend（不带 --reload）
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
   .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 4. 验证（应看到 119 routes / 6 billing / 4 admin-flag / SSE publish-events）
+# 4. 验证（应看到 121 routes / 6 billing / 6 admin-flag 含 /me 和 /tenants /
+#         SSE publish-events 带 id: 行）
 .venv/bin/python -c "from app.main import app; print(len(app.routes))"
 ```
 
@@ -388,6 +401,11 @@ Brief
 | **ArtAgent v3 角色一致性** | ✅ | 双层方案：(1) `_generate_character_anchor` 单独出主角 1:1 参考板（`outputs.character_anchor.url`，未来给 IP-Adapter 用）；(2) `_inject_consistency_into_shots` 把 `[Consistent character: protagonist=...; appearance=...; wardrobe=...]` 强制注入每镜 `enhanced_prompt`，`negative_prompt` 追加防漂关键词；`brief.character_consistency`：`auto`/`prompt-only`/`anchor`/`off`；`brief.protagonist_role` 显式选主角；锚点失败 mode=anchor 自动降到 prompt-only；前端 v3 徽标 + 锚点缩略图 panel + shots 网格 🔒 角标；8 个烟测 PASS |
 | **发布执行器 v1（dry-run / youtube / bilibili）** | ✅ | `app/services/publishing/`：adapter 协议 + dry-run（始终启用，回 mock external_id）/ youtube（真发，需 GOOGLE_CLIENT_ID + OAuth + 安全闸门 `plan.meta.confirm_real_publish=true`）/ bilibili（stub，引导手动上传）+ executor + credentials + oauth helpers；`POST /api/production/publish-plans/{id}/execute` 调入；`GET/DELETE /api/production/platforms/credentials`；`POST /api/production/platforms/{p}/oauth/start` + `GET /api/production/platforms/{p}/oauth/callback`（YouTube）；系统级异常（PublishError）入 DLQ + 502；幂等性：已 `published` 的 plan 拒绝重发；前端 PlanRow 加 Upload 按钮 + plan.error 显示 + external_id；新 `<PlatformCredentialsPanel>`（real/stub 徽标 + 绑定/撤销按钮）；4 场景端到端 PASS |
 | **publish 任务异步化（celery + SSE）** | ✅ | Track-03：`POST /publish-plans/{id}/execute` 默认返 **202 + dispatcher + events_url + Location 头**（`?sync=true` 兼容兜底走 v1 同步路径）；celery task `publish.execute_plan`（queue=default，`acks_late=True`），BackgroundTasks fallback 共用同一 task body 函数保证 SSE 事件流语义一致；新 SSE 端点 `GET /publish-plans/{id}/events`：`event: snapshot` + `event: publish_plan_state phase=running\|completed\|system_error` + 25s `: ping` 心跳；`events.py` 抽出 `_publish_to_channel` / `_subscribe_channel` 内核让 `publish:plan:{id}` 与 `pipeline:run:{id}` 复用同一份 redis pub/sub；前端新 hook `use-publish-plan-stream.ts`（EventSource + 2 次 onerror fallback 2.5s polling），PlanRow 行内 stream/poll 徽标 + `<Loader2 spin>` + 终态 toast；4 路径函数级 + 1 路径队列级烟测 PASS（HTTP TestClient 因 sandbox event loop 没跑，留给真启 backend 后人工 curl）|
+| **YouTube chunked PUT + 进度回写 SSE** | ✅ | Track-13：YouTube adapter 删 v1 multipart 一把发；改成 8 MiB 分片 chunked PUT（`_initiate_resumable_upload` 拿 session uri → `_chunked_put` 切片 + Content-Range 滚动 + 308/200/201 状态机）；单片 5xx/408/429 指数退避重试 1s/2s/4s 最多 3 次，4xx 立即抛 `PublishError`；每完成一片 `progress_cb({phase, bytes_uploaded, total, percent, chunk_index, chunk_count})` → executor `_make_progress_cb` 闭包 read-modify-write `publish_plans.meta_json.upload_progress`（PG `JSON` 列不是 `JSONB` 必须读改写）+ `publish_plan_event(plan_id, "upload_progress", info)` 推 SSE；前端 `use-publish-plan-stream.ts` `addEventListener("upload_progress")` + `<UploadProgressBar>`（下载阶段灰 / 上传阶段 sky）；下载阶段 start/complete 也回调让前端不卡 0%；8 case 协议层 mock 单测 PASS |
+| **DLQ retry 按 task_name 路由** | ✅ | Track-15：`routers/dlq.py::_retry_dispatch` 识别 `task_name="publish.execute_plan"` 改派 `execute_publish_plan_task.apply_async`（celery 模式）/ `BackgroundTasks.add_task(_publish_execute_with_events, ...)`（BG fallback）；其它 task_name 仍走既有 `tick_task` 路径；顺手修隐藏 bug：旧版 router 入口 `if not run_id: 400` 让 publish DLQ 死信无法 retry（publish_plans 与 pipeline_runs 没外键，task 没 run_id）；改成 `task_name="publish.execute_plan"` 时不要求 run_id；7 case 单测覆盖 |
+| **Admin Feature Flags UI** | ✅ | Track-14：后端 `routers/admin_flags.py` 抽 `_is_admin_email`；新加 `GET /api/admin/feature-flags/me`（任何登录用户可调返 `{is_admin, email}` 让前端探测是否渲 admin 入口而不抛 403）+ `GET /tenants`（admin 限定，按 tenant_id 聚合 SELECT + flag_count）；前端新 `app/admin/feature-flags/page.tsx`（968 行）顶部 tenant 选择器 + 表格列 flag_name + value（pct 滑块 / toggle / variant 下拉自适应）+ updated_at + Apply + Delete + 「新增 flag」dialog 从 known_flags 选 + toast；`lib/admin-flags.ts` 5 端点 fetch helper；`sidebar.tsx` mount 时 fetch /me admin 命中渲入口；7 case 单测 |
+| **Stripe webhook charge.refunded + 6 case 单测** | ✅ | Track-16：alembic head `a1b2c3d4e5f6` → `b2c3d4e5f6a7`，加 `subscriptions.refunded_at TIMESTAMPTZ NULL`（不加 server_default 避免老行误打标 / 不加索引退款查询频次极低 / downgrade `drop_column` 无副作用）；`webhook_handlers.py` 加 `_handle_charge_refunded(charge, *, event_id)`：`metadata.subscription_id` 优先 → `customer` 反查最新订阅；都不命中返 `{handled: True, matched: 0, reason: ...}` 让 stripe 不重投；**只打标 refunded_at**，不动 `tenant_quotas` / `users.plan` / `subscriptions.plan`（v1 用户体验优先；ops 评估后人手降级）；6 case 端到端覆盖 5 类 stripe 事件 + unknown |
+| **SSE 断网重连 last_event_id 续传** | ✅ | Track-17：`services/pipeline/events.py` 升级为 redis Stream + pub/sub 双写：`_publish_to_channel` 加 `XADD {channel}:stream * data <json>`（MAXLEN ~1000 approximate trim）+ `PUBLISH {channel}` 保留兼容；`_subscribe_channel` 改用 `xread({stream: cursor}, block=1000)`，`cursor=last_event_id or "$"`；yield 升级为 3-tuple `(event_type, payload, entry_id)`；`subscribe` / `subscribe_publish_plan` 加 `last_event_id` 透传；XADD 失败不阻塞 PUBLISH；redis 不可用 noop；`routers/{pipelines,production}.py::_sse_format(event, data, event_id=None)` 非空时 emit `id: <event_id>\n` 在 `event:` 之前；两个 SSE 端点从 `request.headers.get("Last-Event-ID")` 透传到 subscribe；浏览器原生 EventSource 自动带 `Last-Event-ID` 头不用前端改；10 case 单测 + 3 case 真连 redis 烟测 |
 | **多角色锁定 v5（ArtAgent + VideoAgent）** | ✅ | Track-09：v3/v4 只锁主角；v5 升级为「每个 character_card 各一份 anchor」+「按 `shot.focus_character` 逐镜选对应 anchor + 注入对应前缀」；`_select_relevant_characters`（主角永远保留；其余角色被 focus 引用才纳入，不浪费 image 调用）→ `_generate_character_anchors`（批量出 anchor，单个失败不影响其它）→ `_inject_consistency_into_shots(characters_by_name=)`；`_generate_keyframes(anchors_by_role=)` 多角色 anchor URL 字典；VideoAgent `_select_ref_image` 按 `shot.locked_character` / `focus_character` 选对应 anchor，返 `(url, source, anchor_role)`；outputs 新增 `character_anchors`/`shots[i].locked_character`/`ref_anchor_role`/`ref_image_summary.by_role`/`character_anchors_by_role`；前端 ArtArtifact 多角色 grid（主角 emerald / 配角 violet 边框）+ shots 网格 🔒 角标按 `locked_character` 着色；VideoArtifact 头部按角色统计 + 每镜 `ref_anchor_role` 角标；`character_anchor` 单字段保留为主角的（向后兼容前端 v3 徽标 / 旧 video.py）；6 case + 既有 31 case 零回归 |
 | **canary 灰度 / feature_flags v1** | ✅ | Track-10：新表 `feature_flags(id, tenant_id, flag_name, value_json, created_at, updated_at)` + 唯一约束 `(tenant_id, flag_name)`（alembic `a1b2c3d4e5f6`）；`services/pipeline/feature_flags.py`：`get_flag`/`set_flag`（PG `ON CONFLICT` upsert）/`load_for_tenant`（runner build ctx 时一次性批量）/`is_enabled`；value 形态 `{"pct":0..100}`（hash SHA-1 前 8 hex mod 100，bucket < pct 命中）/`{"enabled":bool}`/`{"variant":"v4"/"v3"/"off"}`；`PipelineContext` 加 `feature_flags`/`tenant_id`/`tenant_plan`；ArtAgent 入口读 `art_ipadapter_pct`：缺省→默认 v4；命中→喂 anchor 走 v4 IP-Adapter；不命中→`anchors_url_by_role={}` 主角镜降到 v3 prompt-only（前缀注入仍生效）；outputs 加 `canary_variant`/`canary_flag_value` 可观测；admin 路由 `GET/PUT/DELETE /api/admin/feature-flags`（邮箱白名单 `ADMIN_EMAILS=...`，fallback `demo@example.com`）；4 case 叠加 multichar 烟测 + service 层 hash 染色稳定性烟测 PASS |
 | **Stripe 计费对接 v2 + tenant_quotas 同步** | ✅ | Track-11：6 路由 `/api/billing/{plan,checkout-session,portal-session,checkout(legacy),portal(legacy),webhook}`；`services/billing/`：`stripe_client.py`（薄封装 SDK + `StripeNotConfigured` 翻 503）/`webhook_handlers.py`（4 事件矩阵：`checkout.session.completed` / `customer.subscription.{updated,deleted}` / `invoice.payment_failed`）/`tenant_sync.py`（`sync_user_plan(user_id, new_plan)` 走 `pipeline.tenant.resolve_tenant_id` → `quota.update_tenant_plan`）；`quota.update_tenant_plan(tenant_id, new_plan)` 新加：UPDATE `tenant_quotas.plan` + 升级取 `PLAN_DEFAULTS` bump `monthly_limit_usd`/`concurrent_max`（降级**保留**运维手调过的值）+ 遍历 `provider_concurrency_buckets` 调 `ensure_bucket(plan=new)` 自动 bump per-provider max_concurrent；新前端 `/app/billing` 三栏 plan 卡片（free/standard/premium）+ Active 徽章 + 「升级」跳 Stripe Checkout / 「管理订阅」跳 Customer Portal；`?session_id=` 跳回参数 1.5s 后 refetch；不动 alembic（复用现有 `subscriptions`/`tenant_quotas`/`provider_concurrency_buckets`）；handler dispatch + tenant_sync 单元烟测 PASS（真 Stripe CLI 联调要本地配 `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` 后跑 `stripe trigger checkout.session.completed`）|
@@ -453,27 +471,24 @@ cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && make pipeline-worker
 
 ## 7. 下一会话主线推荐顺序（带工作量估计）
 
+第三波合完后剩余路线（**核心 v1 上线只差 1-1.5 天工作量**）：
+
 | 优先级 | 任务 | 工作量 | 触发条件 / 价值 |
 |---|---|---|---|
-| ~~★★★~~ ✅ | ~~VoiceAgent v2/v3/v4 字幕对齐 + word-level~~ | ~~2 天~~ | **2026-05-04 22:00 / 22:30 / 05-05 10:00 完成** |
-| ~~★★~~ ✅ | ~~DLQ 前端列表~~ | ~~半天~~ | **2026-05-04 21:00 完成** |
-| ~~★★~~ ✅ | ~~发布执行器 v1 + Track-01 凭证 Fernet 加密 + Track-02 confirm_real_publish 列~~ | ~~2 天~~ | **2026-05-05 11:30 完成** |
-| ~~★~~ ✅ | ~~ArtAgent v3 + v4 IP-Adapter 接入点 + Track-09 多角色锁定~~ | ~~2 天~~ | **2026-05-05 10:45 + 13:55 完成** |
-| ~~★~~ ✅ | ~~配额 v2 tenant 级分桶~~ | ~~半天~~ | **2026-05-05 09:30 完成** |
-| ~~★★~~ ✅ | ~~publish 任务异步化（celery + SSE）~~ | ~~半天~~ | **2026-05-05 13:55 完成（Track-03）**：202 + dispatcher + SSE phase 流；BackgroundTasks fallback 共用 task body |
-| ~~★★~~ ✅ | ~~canary / feature_flags v1~~ | ~~1.5 天~~ | **2026-05-05 13:55 完成（Track-10）**：alembic `a1b2c3d4e5f6`；ArtAgent 入口闸门 + admin 路由 |
-| ~~★★~~ ✅ | ~~Stripe 计费 v2~~ | ~~2 天~~ | **2026-05-05 13:55 完成（Track-11）**：6 路由 + webhook 4 事件矩阵 + tenant_quotas/provider buckets bump |
-| ★★ | **YouTube 真发 chunked PUT + 真账号 e2e** | 半天 | 当前 youtube adapter 用 resumable upload 一把发；1080p 大文件可能超 timeout；改 chunked 8-16MiB PUT，加进度回写 `plan.meta_json.upload_progress`；同时跑一次真 OAuth + 真上传 + 真 video_id 落 `external_id` 闭环 |
-| ★ | **前端 Admin · Feature Flags 管理面板** | 1 天 | Track-10 当前只暴露 HTTP API；前端在 settings 加一个 tab：列 tenant 全部 flag + 滑块改 pct + Apply；带 audit log 展示（who / when / from / to） |
-| ★ | **DLQ retry 识别 publish.execute_plan** | 1-2 小时 | Track-03 follow-up：当前 DLQ retry 走 `_retry_dispatch(tick_task)`，对 publish task 不生效；在 `routers/dlq.py::retry` 识别 `task_name="publish.execute_plan"` 时改派 `execute_publish_plan_task.delay(*args)` |
-| ★ | **Stripe webhook handler 单元测试 + 失败支付路径** | 半天 | Track-11 follow-up：模拟 stripe Event payload 跑 `handle_webhook_event` 断言 DB 变化；补 `charge.refunded` 处理（v1 故意没接） |
-| ★★ | **bilibili 自动发布**（依赖商务）| 2-3 天 | Track-12：等 MCN/合作伙伴入驻拿 OpenAPI；adapter stub 已留好 |
-| ★ | **SSE 断网重连续传** | 半天 | 当前 `: ping` + onerror fallback 已够用；加 `last_event_id` 让客户端断网重连不丢事件（pipeline + publish 两条 SSE 一起做） |
-| ★ | **ArtAgent v4 多角色 IP-Adapter 真接入** | 1-1.5 天 | Track-09 已把 anchors_by_role 喂进 `_generate_keyframes(image_url=)`；等 SiliconFlow Kolors-IP / Flux Redux 上 multi-IP 端点后，改 `siliconflow_image.py` 兼容多 ref，agents 不动 |
+| ~~★★~~ ✅ 第一+二波 | ~~Voice/Art/Edit/Publish/Quota/Canary/Stripe~~ | ~~10 天~~ | 2026-05-04+05 全 done |
+| ~~★★~~ ✅ 第三波 | ~~T-13 / T-14 / T-15 / T-16 / T-17~~ | ~~2.5 天~~ | **2026-05-05 14:30 全 done**：YouTube chunked / Admin UI / DLQ retry / Stripe refunded / SSE last-event-id |
+| ★★ | **T-18 model_calls 加 tenant_id + 按 tenant 聚合** | 半天 | 配额 v2 已按 tenant 算，`model_calls` 表还按 user 聚合；改 alembic 加 `model_calls.tenant_id` + `gateway.record_call` 写 + 新 cost 端点；alembic head 升到 `c3d4e5f6a7b8` 顶 `b2c3d4e5f6a7`（T-16 已合，可以启动） |
+| ★★ | **YouTube 真账号 e2e + Stripe 真账号 e2e** | 半天 | 都是协议链路已通，只差用户配真 key + 跑一次：Track-13 chunked PUT 协议层 mock 测过；Track-16 webhook 单测覆盖 5 事件；用户在 `.env` 配 `GOOGLE_CLIENT_ID/SECRET` + `STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET` 后跑一次 60MB 视频真上传 + 一次 4242 卡 checkout 即可 |
+| ★★ | **T-12 bilibili 自动发布**（依赖商务）| 2-3 天 | 等 MCN/合作伙伴入驻拿 OpenAPI；adapter stub 已留好 |
+| ★ | **T-19 ArtAgent v6 真 multi-IP**（外部依赖）| 1-1.5 天 | 等 SiliconFlow Kolors-IP / Replicate Flux Redux 上 multi-IP 端点；当前 Track-09 `anchors_by_role` 接入点已留 |
 | ★ | **L-04 月账单 PDF + 邮件** | 1 天 | Track-11 follow-up：拿 stripe `invoice.paid` 渲染 PDF + 邮件 |
-| ★ | **L-05 RBAC：workspace member editor/viewer 权限** | 1.5 天 | Track-10 admin 路由当前是邮箱白名单，正经 RBAC 还没做 |
-| ★ | **L-11 model_calls 加 tenant_id + 按 tenant 聚合** | 半天 | 配额 v2 落地后，`model_calls` 表还在按 user 聚合；改成 tenant 维度成本看板 |
+| ★ | **L-05 真 RBAC（workspace member editor/viewer）** | 1.5 天 | 替换 Track-10/14 邮箱白名单 |
+| ★ | **L-13 ADMIN_EMAILS 迁回 Settings** | 0.5 天 | Track-10/14 留的 cleanup（Track-01 互斥锁早已解除） |
 | ★ | **L-12 前端 i18n 完整覆盖** | 1.5 天 | 当前 zh/en 部分页面有缺失 |
+| ★ | **L-03 metric dashboard（cost / view_count 时序）** | 1.5 天 | 配 T-18 model_calls.tenant_id 一起做能直接出按 tenant 视图 |
+| ★ | **L-10 配额超限 SSE 实时推送** | 半天 | 用 Track-17 redis Stream 现成框架推 `quota_exceeded` 事件 |
+| ★ | **T-15 follow-up：DLQ retry 端点身份切换** | 1 小时 | retry 当前用调用者 user_id，应该用死信原 user_id（避免 admin 重投覆盖审计身份）|
+| ★ | **T-13 follow-up：上传进度 fallback polling** | 1 小时 | SSE 不可用时前端拉 `publish_plans.meta_json.upload_progress` 字段轮询展示 |
 
 > 不建议下次先做：langgraph 整体替换（见 ADR-002）。
 
@@ -495,7 +510,8 @@ fliki-clone-api/
 │   ├── 20260505_0900_add_tenant_quota_and_provider_buckets.py (rev c2f9b7a04ef1)
 │   ├── 20260505_1100_add_platform_credentials.py (rev 8b1f6c2d4a93)
 │   ├── 20260505_1200_add_publish_plan_confirm_real.py (rev 9c2d4e5f6a7b)
-│   └── 20260505_1300_add_feature_flags.py (rev a1b2c3d4e5f6)  ← head ★ Track-10
+│   ├── 20260505_1300_add_feature_flags.py (rev a1b2c3d4e5f6)  ← Track-10
+│   └── 20260505_1500_add_subscription_refunded_at.py (rev b2c3d4e5f6a7)  ← head ★ Track-16
 ├── app/
 │   ├── main.py
 │   ├── config.py
@@ -615,22 +631,22 @@ Redis 在跑（`redis-cli ping → PONG`）。
 ```
 延续 2026-05-04 + 05-05 全天会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
 仓库：https://github.com/gyzhao666-tech/fliki-clone（monorepo）。
-当前能跑 video_full 端到端：配额 v2 tenant + provider 桶 / VoiceAgent v4 word-level
-（OpenAI Whisper 或本地 faster-whisper）/ ArtAgent v3+v4+v5（多角色 anchor 锁定，按
-shot.focus_character 逐镜选 + canary 灰度按 tenant_id hash 染色 v4↔v3-prompt-only）/
-VideoAgent v2 i2v 多角色 anchor / EditAgent v5 / 发布执行器 v1（dry-run/youtube/bilibili，
-含 confirm_real_publish 列 + Fernet 凭证加密 + OAuth）+ publish 任务异步化（celery + SSE
-phase 流）/ feature_flags v1 + admin 路由 / Stripe 计费 v2（webhook 落 tenant_quotas +
-provider bucket bump）/ DAG 视图 / pytest 41 case 全过。
+当前能跑 video_full 端到端 + 全发布闭环：配额 v2 tenant + provider 桶 / VoiceAgent v4
+word-level / ArtAgent v3+v4+v5（多角色 anchor 按 shot.focus_character 逐镜选 +
+canary 按 tenant_id hash 染色 v4↔v3-prompt-only）/ VideoAgent v2 i2v 多角色 anchor /
+EditAgent v5 / 发布执行器 v1（dry-run/youtube/bilibili，YouTube 升级 8 MiB chunked
+PUT + 进度回写 SSE 不再卡 1080p timeout / Fernet 凭证加密 / OAuth）+ publish 异步化
+（celery + SSE phase 流 + last_event_id 断网续传）/ DLQ retry 按 task_name 路由 /
+feature_flags v1 + 后端 admin 路由 + 前端 admin 管理面板（pct 滑块/toggle/variant）/
+Stripe 计费 v2 含 charge.refunded 退款打标 / DAG 视图 / pytest 79 case 全过。
 请直接做（除非我另说）：
-(A) YouTube 真发 chunked PUT + 真账号 e2e（半天）；
-(B) 前端 Admin · Feature Flags 管理面板（1 天）；
-(C) DLQ retry 识别 publish.execute_plan task（1-2 小时）；
-(D) Stripe webhook handler 单元测试 + charge.refunded（半天）；
-(E) bilibili 自动发布（等 MCN，2-3 天，商务问题）。
-开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 a1b2c3d4e5f6；
-            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 41 PASS；
-            (5) 重启 backend 才会加载第二波 4 Track 新代码；
+(A) T-18 model_calls 加 tenant_id 聚合（半天，alembic c3d4e5f6a7b8 顶 b2c3d4e5f6a7）；
+(B) YouTube + Stripe 真账号 e2e（半天，链路全通只差用户 .env 配真 key）；
+(C) T-12 bilibili 自动发布（等 MCN，2-3 天，商务问题）；
+(D) T-19 ArtAgent v6 真 multi-IP（等 SiliconFlow / Replicate 端点，外部依赖）。
+开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 b2c3d4e5f6a7；
+            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 79 PASS；
+            (5) 重启 backend 才会加载第二+三波 9 条 Track 新代码（pid 30876 仍在 11:13 旧版）；
             (6) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
 ```
 
