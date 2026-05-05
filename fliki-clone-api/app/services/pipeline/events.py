@@ -62,6 +62,17 @@ def _plan_channel(plan_id: str) -> str:
     return f"publish:plan:{plan_id}"
 
 
+def _user_channel(user_id: str) -> str:
+    """Track-25：用户级配额/桶满事件通道（跨 run / 跨 plan）。
+
+    与 `pipeline:run:{run_id}` / `publish:plan:{plan_id}` 互斥；
+    一个用户全局一条通道，layout.tsx 全局挂一个 hook 即可监听
+    `quota_exceeded` / `bucket_full`，避免每次启动 run 才能感知额度问题。
+    """
+
+    return f"user:{user_id}"
+
+
 def _stream_key(channel: str) -> str:
     """Track-17：每个 pub/sub 频道对应一条 redis Stream，名字加 `:stream` 后缀。
 
@@ -165,6 +176,26 @@ def publish_plan_event(
     """
 
     _publish_to_channel(_plan_channel(plan_id), event_type, payload)
+
+
+def publish_user_event(
+    user_id: str, event_type: str, payload: dict[str, Any]
+) -> None:
+    """Track-25：把用户级事件推到 `user:{user_id}` 频道。
+
+    使用场景：
+    - quota.reserve_tenant 在抛 402 之前推 `quota_exceeded`
+    - provider_buckets.acquire 在 BucketFull 时推 `bucket_full`
+
+    设计：
+    - 与 pipeline run / publish plan 互不打扰（独立 channel + 独立 stream key）
+    - 不传 user_id（None / 空串）时静默 noop，避免把后端 publishing 异常放大到调用栈
+    - redis 不可用时 `_publish_to_channel` 内部已 warning + noop
+    """
+
+    if not user_id:
+        return
+    _publish_to_channel(_user_channel(user_id), event_type, payload)
 
 
 # ── subscribe (async) ─────────────────────────────────────────────────────────
@@ -304,9 +335,36 @@ async def subscribe_publish_plan(
         yield item
 
 
+async def subscribe_user(
+    user_id: str,
+    *,
+    last_event_id: Optional[str] = None,
+    stop_event: Optional[asyncio.Event] = None,
+) -> AsyncIterator[Optional[tuple[str, dict[str, Any], Optional[str]]]]:
+    """Track-25：订阅 `user:{user_id}` 频道的用户级事件流。
+
+    与 `subscribe` / `subscribe_publish_plan` 共用 `_subscribe_channel` 内核；
+    SSE 端点拿到 `(event_type, payload, event_id)` 转下发即可。
+
+    用户级 SSE 是「长连接 / 不主动终止」：只要客户端在线就一直挂着；
+    路由层根据 30 分钟兜底 + 客户端断开自动结束。
+    """
+
+    if not user_id:
+        return
+    async for item in _subscribe_channel(
+        _user_channel(user_id),
+        last_event_id=last_event_id,
+        stop_event=stop_event,
+    ):
+        yield item
+
+
 __all__ = [
     "publish",
     "publish_plan_event",
+    "publish_user_event",
     "subscribe",
     "subscribe_publish_plan",
+    "subscribe_user",
 ]
