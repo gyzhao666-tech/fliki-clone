@@ -57,10 +57,12 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
    git checkout track-XX-<your-track>
    ```
 2. **不要切换分支**；不要 rebase / merge main；改完留 commit 在 feature branch 上，由人类合并。
-3. **alembic 互斥锁**：只有 Track-02 的 agent 可以加新 alembic migration。其他 Track**禁止**改 schema；
-   需要新字段时优先用 `meta_json` / `outputs_json` 等已有 JSON 列承载。
-4. **`.env` 互斥锁**：只有 Track-01 的 agent 可以改 `.env` / `app/config.py`（追加新 settings 字段）。
-5. **`pipeline/page.tsx` 大文件分段**：见每个 Track 注明的具体 panel/section，不要越界。
+3. **alembic 互斥锁**：第三波本批中**只有 Track-16** 占用迁移槽（rev `b2c3d4e5f6a7` 顶 `a1b2c3d4e5f6`）。
+   其它 Track**禁止**改 schema；需要新字段优先用 `meta_json` / `outputs_json` 等已有 JSON 列承载。
+   T-18 / T-19 标记 ⏸ 待 T-16 合并后再启动，避免 alembic 分叉。
+4. **`.env` 互斥锁**：第三波本批**没人**需要改 `.env` / `app/config.py`（既有 `STRIPE_*` / `ADMIN_EMAILS` 已就绪）。
+5. **`pipeline/page.tsx` 大文件分段**：T-13 独占 `PlanRow` 进度条段；其它 Track 不动此文件。
+   `use-publish-plan-stream.ts` 大文件分段：T-13 独占 `handleEvent` switch case；T-17 独占 `buildEventSource` 框架——同文件不同函数。
 6. **commit message 风格**：参考 baseline；中英混合 OK；要写**为什么**（why）而非只列 what。
 7. **完成后写一份 `TRACK_<ID>_NOTES.md` 在仓库根**：包含：
    - 改了哪些文件 + 为什么
@@ -150,17 +152,120 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 ### Track-12 · bilibili 自动发布（依赖商务入驻）★ (2-3 天)
 - 等 MCN OpenAPI；技术骨架已在 `adapters/bilibili.py` 留好
 
-## 2.5 第三波候选（建议下次派发）
+## 2.5 第三波（5 条 feature 分支已预创建本地；T-18 / T-19 待 T-16 alembic 合并后再派）
 
-| 优先级 | Track ID | 内容 | 工作量 |
-|---|---|---|---|
-| ★★ | T-13 | YouTube chunked PUT + 真账号 e2e（替换 resumable upload；avoid 1080p timeout；进度回写 `plan.meta_json.upload_progress`） | 半天 |
-| ★ | T-14 | 前端 Admin · Feature Flags 管理面板（settings 加 tab；列 tenant 全部 flag + 滑块改 pct + Apply；audit log 展示） | 1 天 |
-| ★ | T-15 | DLQ retry 识别 `task_name="publish.execute_plan"` 改派 `execute_publish_plan_task.delay` | 1-2 小时 |
-| ★ | T-16 | Stripe webhook 单元测试 + `charge.refunded` 退款事件处理 | 半天 |
-| ★ | T-17 | SSE 断网重连 `last_event_id`（pipeline + publish 两条流） | 半天 |
-| ★ | T-18 | model_calls 加 tenant_id + 按 tenant 聚合（L-11 升优） | 半天 |
-| ★ | T-19 | ArtAgent v6 多角色 IP-Adapter 真接入（等 Kolors-IP / Flux Redux multi-IP 端点） | 1-1.5 天 |
+> 派发原则：每条 Track 一个 Cursor Agent Window；同时派 5 条无文件冲突；alembic 互斥锁只让 T-16 一条占用本波迁移槽。
+> 累计工作量 ≈ 半天 + 1天 + 2小时 + 半天 + 半天 = 2.5 天（5 个 agent 并行 ≈ 1 天墙钟）。
+
+### Track-13 · YouTube chunked PUT + 真账号 e2e ★★ (半天)
+
+- **分支**：`track-13-youtube-chunked-upload`
+- **目标**：当前 `adapters/youtube.py` 用 resumable upload 一把发，1080p / 60s+ 视频易触 60s HTTP timeout。改成 8 MiB 分片 chunked PUT + 进度回写 `plan.meta_json.upload_progress`，每片完通过 SSE 推 `upload_progress` 事件让前端进度条流畅。
+- **修改文件**：
+  - `fliki-clone-api/app/services/publishing/adapters/youtube.py`：拆 `_initiate_upload()` 拿 upload_url；新加 `_chunked_put(upload_url, video_bytes_iter, chunk_size=8*1024*1024, on_progress=cb)` → 每片带 `Content-Range: bytes X-Y/total`，HTTP 308 滚到下一片，最后片返 200 + `{id: video_id}`；5xx/408/429 指数退避重试每片最多 3 次
+  - `fliki-clone-api/app/services/publishing/executor.py`：execute_plan 给 youtube adapter 传 `progress_cb = lambda info: _write_progress(plan_id, info)`；cb 内开新 session UPDATE `publish_plans.meta_json` JSONB merge `{"upload_progress": info}` + 调 `publish_plan_event(plan_id, "upload_progress", info)` 推 SSE
+  - `fliki-clone/src/hooks/use-publish-plan-stream.ts::handleEvent`：switch case 加 `upload_progress` → 调 `onEvent({type: "upload_progress", percent, bytes_uploaded, total})`
+  - `fliki-clone/src/app/[locale]/(app)/app/project/[id]/pipeline/page.tsx::PlanRow`：执行中 + 收到 upload_progress 后渲染 `<Progress value={percent}/>` 带 `{bytes_uploaded}/{total}` 文案
+- **互斥锁（独占）**：`adapters/youtube.py`、`executor.py` 进度 cb 段、`use-publish-plan-stream.ts::handleEvent` switch case（与 Track-17 互不干涉，T-17 改的是底层 EventSource 框架）、`pipeline/page.tsx::PlanRow` 进度条段
+- **依赖**：✅ Track-03 已合（事件流通道复用）；✅ Track-01 已合（Fernet 凭证）
+- **烟测**：
+  - 单元：mock httpx 让首请求返 `Location: ...?upload_id=`，每片返 308 + Range，最后片返 200 → 断 progress_cb 被调 N 次（N = 总片数）+ 重试逻辑（5xx → 指数退避）
+  - 真账号 e2e（用户配真 GOOGLE_CLIENT_ID + OAuth）：60MB 测试 mp4 → SSE 流应看到 0%→13%→26%→...→100% 进度推送 + `external_id` 真 youtube id
+- **不做**：alembic schema 改；bilibili 适配（Track-12 商务问题）
+
+### Track-14 · 前端 Admin · Feature Flags 管理面板 ★ (1 天)
+
+- **分支**：`track-14-admin-flags-ui`
+- **目标**：把 Track-10 的 `/api/admin/feature-flags` HTTP API 包装成可视化面板。Admin（`ADMIN_EMAILS` 邮箱白名单）能列 tenant 的 flag、改 pct 滑块、Apply、查看变更历史。
+- **修改文件**：
+  - **新页面** `fliki-clone/src/app/[locale]/(app)/app/admin/feature-flags/page.tsx`：
+    - 顶部 tenant 选择器（拉 `/api/admin/feature-flags/tenants` 列表）
+    - 表格：flag_name / value（pct 滑块 0-100 / enabled toggle / variant 下拉）/ updated_at / Apply / Delete
+    - 「新增 flag」dialog：从 known list 选 flag_name + 形态
+  - **新** `fliki-clone/src/lib/admin-flags.ts`：TS 类型（`AdminFlagOut`）+ fetch helper（`listTenants` / `listTenantFlags(tid)` / `setTenantFlag(tid, name, value)` / `deleteTenantFlag(tid, name)`）
+  - `fliki-clone/src/components/app-shell.tsx`（或 settings 侧栏）：admin 邮箱命中时多一个「Admin · Feature Flags」入口（tsx 文件名按现有结构调整）
+  - `fliki-clone-api/app/routers/admin_flags.py`：加 `GET /api/admin/feature-flags/tenants` → `SELECT DISTINCT tenant_id FROM feature_flags ORDER BY tenant_id`；admin 鉴权同既有
+- **互斥锁（独占）**：前端 admin 目录全部新文件、`src/lib/admin-flags.ts`、`admin_flags.py` 加 list-tenants 端点（小段独占）
+- **依赖**：✅ Track-10 已合
+- **烟测**：admin 邮箱登录 → 进 `/app/admin/feature-flags` → 选 tenant → 改 pct=50 → Apply → 后端 PUT 落库 → 该 tenant 下次跑 video_full 看 outputs.canary_variant 50/50 分布
+- **不做**：完整 RBAC（L-05 长尾）；后端 audit log 落库（先前端 stub）
+
+### Track-15 · DLQ retry 识别 publish task ★ (1-2 小时)
+
+- **分支**：`track-15-dlq-retry-publish`
+- **目标**：当前 `routers/dlq.py::_retry_dispatch` 把所有死信都 dispatch 到 `tick_task`；publish.execute_plan 死信被重试时 worker 收到的是 tick task 不会真重发布。识别 task_name 路由到正确的 task。
+- **修改文件**：
+  - `fliki-clone-api/app/routers/dlq.py::_retry_dispatch(dead, background_tasks)`：加 task_name 分支
+    ```python
+    if dead.task_name == "publish.execute_plan":
+        from app.services.pipeline.tasks import (
+            execute_publish_plan_task, _publish_execute_with_events,
+        )
+        plan_id = (dead.args or [None])[0]
+        user_id = (dead.kwargs or {}).get("user_id")
+        if settings.celery_enabled:
+            execute_publish_plan_task.apply_async(args=[plan_id], kwargs={"user_id": user_id}, queue="default")
+        else:
+            background_tasks.add_task(_publish_execute_with_events, plan_id, user_id)
+    else:
+        # 既有 tick_task 路径
+        ...
+    ```
+  - `fliki-clone-api/tests/test_dlq_retry_publish.py`（新文件）：构造一条 `task_name="publish.execute_plan"` 的死信 + monkeypatch `execute_publish_plan_task.apply_async` → 调 `_retry_dispatch` 断 mock 被调一次（celery 路径）+ BackgroundTasks 路径同样断 add_task 收到正确函数引用
+- **互斥锁（独占）**：`routers/dlq.py::_retry_dispatch` 函数体（小段；不影响其它 dlq 路由）
+- **依赖**：✅ Track-03 已合
+- **烟测**：单元测试 PASS；可选人工：用前端 DLQ panel 把一条 publish 死信 retry，看 `dead_letter_tasks.status='retried'` + redis `default` 队列收到 `publish.execute_plan` payload
+- **不做**：DLQ 死信批量 retry / 自动 retry 策略 / time_limit 硬超时
+
+### Track-16 · Stripe webhook 单元测试 + 退款事件 ★★ (半天)
+
+- **分支**：`track-16-stripe-webhook-tests`
+- **目标**：(1) pytest 套件目前没覆盖 Track-11 webhook handlers；用模拟 stripe Event 跑 `handle_webhook_event` 断言 DB 变化，5 种事件全覆盖。(2) 补 `charge.refunded` 事件：写 `subscriptions.refunded_at` 打标，**不动** `tenant_quotas`（保留当月配额到自然月末，用户体验优先；后续 ops 工具人手回滚）。
+- **修改文件**：
+  - **新 alembic** `fliki-clone-api/alembic/versions/20260505_1500_add_subscription_refunded_at.py`（rev `b2c3d4e5f6a7`，顶 `a1b2c3d4e5f6`）：加 `subscriptions.refunded_at: TIMESTAMP NULL`
+  - `fliki-clone-api/app/models/subscription.py`：加 `refunded_at: Optional[datetime]`
+  - `fliki-clone-api/app/services/billing/webhook_handlers.py`：加 `_handle_charge_refunded(event)` → UPDATE `subscriptions.refunded_at = now()` WHERE `stripe_charge_id = event.data.object.id`；不调 `sync_user_plan`；事件矩阵字典加 `"charge.refunded": _handle_charge_refunded`
+  - `fliki-clone-api/tests/test_billing_webhook.py`（新文件）：本文件内定义 `make_event(type, **fields)` helper（不污染 conftest）；6 个 case 覆盖：
+    - checkout.session.completed → `subscriptions` insert + `tenant_quotas.plan` 同步
+    - customer.subscription.updated → plan 切换
+    - customer.subscription.deleted → 切回 free
+    - invoice.payment_failed → 写日志（v1 不改 DB）
+    - charge.refunded → `subscriptions.refunded_at` 写入；`tenant_quotas.plan` 不变
+    - 未知事件 → handled=False
+- **互斥锁（独占）**：alembic 槽 rev `b2c3d4e5f6a7`、`models/subscription.py` 加列、`services/billing/webhook_handlers.py` 加新 handler 函数、新 `tests/test_billing_webhook.py`
+- **依赖**：✅ Track-11 已合
+- **烟测**：`pytest tests/test_billing_webhook.py -v` 6/6 PASS；`alembic upgrade head` + `downgrade -1` + `upgrade head` 来回测一次
+- **不做**：邮件通知（L-04 长尾）；自动配额回滚（v1 故意不做）
+
+### Track-17 · SSE 断网重连 last_event_id ★ (半天)
+
+- **分支**：`track-17-sse-resume`
+- **目标**：当前 SSE 在网络抖动断流后客户端只能从 `snapshot` 重头拉，丢一批 step_state；改成 redis Stream（XADD/XREAD）+ 服务端响应每条事件带 `id:` 字段 + 服务端读 `Last-Event-ID` 头从断点恢复，浏览器 EventSource 原生支持自动断网重连续传。
+- **修改文件**：
+  - `fliki-clone-api/app/services/pipeline/events.py`：
+    - `_publish_to_channel(channel, payload)`：双写 redis pub/sub（保留兼容） + redis Stream `XADD {channel}:stream * data <json>`（自动 id）；`MAXLEN ~ 1000` trim
+    - `_subscribe_channel(channel, *, last_event_id=None, stop_event)`：从 last_event_id（或 `$`）起 `XREAD BLOCK 1000ms`；事件 envelope 多带 `id` 字段；保留 idle yield None 让上层心跳
+  - `fliki-clone-api/app/routers/pipelines.py::stream_run_events`：读 `request.headers.get("Last-Event-ID")` 传给 subscribe；SSE 每条事件 emit `id: {event_id}\n` 在 `event:` 之前
+  - `fliki-clone-api/app/routers/production.py::stream_publish_plan_events`：同样改
+  - `fliki-clone/src/hooks/use-pipeline-stream.ts::buildEventSource`：原生 EventSource 自动带 Last-Event-ID 头不用前端改；只需保证 hook **不在** onerror 时强制重置（让浏览器自然重连即可）
+  - `fliki-clone/src/hooks/use-publish-plan-stream.ts::buildEventSource`：同
+- **互斥锁（独占）**：`services/pipeline/events.py` 内核（与 Track-15 / Track-16 不冲突）、两个 router 的 SSE generator 段、两个前端 hook 的 `buildEventSource()` 段（**与 Track-13 错峰**：T-13 改 `handleEvent` switch case 加 upload_progress；T-17 改 `buildEventSource` connection 框架；同文件不同函数）
+- **依赖**：✅ Track-03 已合
+- **烟测**：起 backend → curl `-N -H "Accept: text/event-stream"` 拉 SSE 几条事件 → kill curl 模拟断网 → 用 `-H "Last-Event-ID: <prev_id>"` 重连 → 应只收 prev 之后的事件；附 unit：mock redis `XREAD` 返事件断 envelope.id 单调递增
+- **不做**：多客户端 fan-out 优化；redis Stream 跨进程 consumer group
+
+---
+
+### Track-18 · model_calls 加 tenant_id + 按 tenant 聚合 ★ (半天) ⏸ 待 T-16 合并后启动
+
+- **分支**：`track-18-model-calls-tenant`（待 T-16 合并后由协调者创建）
+- **依赖**：T-16 alembic 合并到 main 后才启动；T-18 写 alembic rev `c3d4e5f6a7b8` 顶 T-16 的 `b2c3d4e5f6a7`，避免 alembic 分叉
+- **目标 / 修改文件 / 烟测**：见 SESSION_HANDOFF.md 第 7 节 T-18 行
+
+### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
+
+- **分支**：`track-19-multi-ip-adapter`
+- **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
 
 ## 3. 长尾（任意时机）
 
