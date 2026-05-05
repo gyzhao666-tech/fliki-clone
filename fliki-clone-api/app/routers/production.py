@@ -16,7 +16,7 @@ import uuid
 from datetime import datetime
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
@@ -24,6 +24,7 @@ from sqlalchemy import create_engine, text
 from app.config import get_settings
 from app.deps import CurrentUser
 from app.models.production import PUBLISH_STATUSES, REVIEW_SEVERITIES
+from app.services.auth.rbac import require_role
 from app.services.pipeline import events as pipeline_events
 from app.services.publishing import (
     PublishError,
@@ -35,6 +36,11 @@ from app.services.publishing import oauth as _publish_oauth
 
 
 router = APIRouter(prefix="/production", tags=["Production"])
+
+# Track-27 · 写权限：admin / editor 都能改；viewer 只能读
+# - 复用一份 Depends 实例：FastAPI 在路由收集阶段会按 (callable, scope) 去重，
+#   多端点共用同一份 require_role 调用结果不会引入额外的 dep tree 节点
+_writer_required = Depends(require_role(["admin", "editor"]))
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -398,6 +404,7 @@ async def list_publish_plans(
 @router.post(
     "/publish-plans", response_model=PublishPlanOut,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[_writer_required],
 )
 async def create_publish_plan(
     body: PublishPlanIn, current_user: CurrentUser
@@ -430,7 +437,11 @@ async def create_publish_plan(
     return _load_plan_or_404(plan_id)
 
 
-@router.patch("/publish-plans/{plan_id}", response_model=PublishPlanOut)
+@router.patch(
+    "/publish-plans/{plan_id}",
+    response_model=PublishPlanOut,
+    dependencies=[_writer_required],
+)
 async def patch_publish_plan(
     plan_id: str, body: PublishPlanPatch, current_user: CurrentUser
 ) -> PublishPlanOut:
@@ -473,7 +484,7 @@ async def patch_publish_plan(
     return _load_plan_or_404(plan_id)
 
 
-@router.delete("/publish-plans/{plan_id}")
+@router.delete("/publish-plans/{plan_id}", dependencies=[_writer_required])
 async def delete_publish_plan(
     plan_id: str, current_user: CurrentUser
 ) -> dict[str, bool]:
@@ -572,7 +583,10 @@ async def list_file_versions(
 
 
 @router.post(
-    "/versions", response_model=VersionOut, status_code=status.HTTP_201_CREATED
+    "/versions",
+    response_model=VersionOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_writer_required],
 )
 async def create_version(
     body: VersionIn, current_user: CurrentUser
@@ -610,7 +624,11 @@ async def create_version(
     return _load_version_or_404(vid)
 
 
-@router.post("/versions/{version_id}/publish", response_model=VersionOut)
+@router.post(
+    "/versions/{version_id}/publish",
+    response_model=VersionOut,
+    dependencies=[_writer_required],
+)
 async def set_version_published(
     version_id: str, current_user: CurrentUser
 ) -> VersionOut:
@@ -633,7 +651,7 @@ async def set_version_published(
     return _load_version_or_404(version_id)
 
 
-@router.delete("/versions/{version_id}")
+@router.delete("/versions/{version_id}", dependencies=[_writer_required])
 async def delete_version(
     version_id: str, current_user: CurrentUser
 ) -> dict[str, bool]:
@@ -769,7 +787,7 @@ def _dispatch_publish_execute(
     return "background"
 
 
-@router.post("/publish-plans/{plan_id}/execute")
+@router.post("/publish-plans/{plan_id}/execute", dependencies=[_writer_required])
 async def execute_publish_plan_route(
     plan_id: str,
     current_user: CurrentUser,
