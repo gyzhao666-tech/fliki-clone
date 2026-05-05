@@ -1177,6 +1177,11 @@ function StepArtifacts({
       out.character_anchor && typeof out.character_anchor === "object"
         ? (out.character_anchor as Record<string, unknown>)
         : null;
+    // v5：多角色 anchor 字典（dict[name -> anchor]）；v3 老 run 时为 null
+    const characterAnchors =
+      out.character_anchors && typeof out.character_anchors === "object"
+        ? (out.character_anchors as Record<string, Record<string, unknown>>)
+        : null;
     const protagonistName =
       typeof out.protagonist_name === "string"
         ? (out.protagonist_name as string)
@@ -1234,7 +1239,97 @@ function StepArtifacts({
             ) : null}
           </div>
         ) : null}
-        {characterAnchor && characterAnchor.url ? (
+        {/* v5：多角色 anchors 优先展示；缺失时退回 v3 单 anchor 渲染 */}
+        {characterAnchors && Object.keys(characterAnchors).length ? (
+          <div className="flex flex-col gap-1.5">
+            <div className="text-[11px] font-medium text-muted-foreground">
+              角色锚点（{Object.keys(characterAnchors).length}）
+              {Object.keys(characterAnchors).length > 1 ? (
+                <span
+                  className="ml-1 rounded bg-violet-500/15 px-1 py-0.5 text-[9px] text-violet-500"
+                  title="v5 多角色锁定：每个 character_card 各出一份 anchor，逐镜按 focus_character 选对应 anchor + 注入对应前缀"
+                >
+                  v5 多角色
+                </span>
+              ) : null}
+            </div>
+            <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2">
+              {Object.entries(characterAnchors).map(([name, anchor]) => {
+                const url =
+                  typeof anchor.url === "string"
+                    ? (anchor.url as string)
+                    : null;
+                const isProtagonist = name === protagonistName;
+                const err =
+                  typeof anchor.error === "string"
+                    ? (anchor.error as string)
+                    : null;
+                return (
+                  <div
+                    key={name}
+                    className={`flex items-start gap-2 rounded border p-2 ${
+                      isProtagonist
+                        ? "border-emerald-500/30 bg-emerald-500/5"
+                        : "border-violet-500/30 bg-violet-500/5"
+                    }`}
+                  >
+                    {url ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={url}
+                        alt={`character anchor ${name}`}
+                        className="size-16 shrink-0 rounded object-cover"
+                        loading="lazy"
+                      />
+                    ) : (
+                      <div className="flex size-16 shrink-0 items-center justify-center rounded bg-rose-500/10 text-[10px] text-rose-400">
+                        ✕
+                      </div>
+                    )}
+                    <div className="flex min-w-0 flex-col gap-0.5 text-[11px]">
+                      <div className="font-medium">
+                        <code className="font-mono">{name}</code>
+                        {isProtagonist ? (
+                          <span className="ml-1 text-[9px] text-emerald-500">
+                            主角
+                          </span>
+                        ) : (
+                          <span className="ml-1 text-[9px] text-violet-500">
+                            配角
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-muted-foreground line-clamp-2">
+                        {(anchor.appearance as string) || ""}
+                        {anchor.wardrobe
+                          ? `；${anchor.wardrobe as string}`
+                          : ""}
+                      </div>
+                      {err ? (
+                        <div
+                          className="truncate text-[10px] text-rose-400"
+                          title={err}
+                        >
+                          ✕ {err}
+                        </div>
+                      ) : (
+                        <div className="text-[10px] text-muted-foreground">
+                          {(anchor.provider as string) || "—"}
+                          {anchor.model
+                            ? ` / ${anchor.model as string}`
+                            : ""}
+                          {typeof anchor.cost_usd === "number"
+                            ? ` · $${(anchor.cost_usd as number).toFixed(4)}`
+                            : ""}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : characterAnchor && characterAnchor.url ? (
           <div className="flex items-start gap-2 rounded border border-emerald-500/30 bg-emerald-500/5 p-2">
             {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
@@ -1337,6 +1432,20 @@ function StepArtifacts({
                     ? (s.keyframe_error as string)
                     : null;
                 const characterLocked = s.character_locked === true;
+                // v5：本镜真正被锁定的角色名（focus_character 命中的卡）
+                const lockedCharacter =
+                  typeof s.locked_character === "string"
+                    ? (s.locked_character as string)
+                    : null;
+                const focusCharacter =
+                  typeof s.focus_character === "string"
+                    ? (s.focus_character as string)
+                    : null;
+                const isNonProtagonistShot =
+                  characterLocked &&
+                  lockedCharacter &&
+                  protagonistName &&
+                  lockedCharacter !== protagonistName;
                 const ipAdapterUsed = s.ip_adapter_used === true;
                 const ipDegradeReason =
                   typeof s.ip_adapter_degrade_reason === "string"
@@ -1363,15 +1472,23 @@ function StepArtifacts({
                     {characterLocked ? (
                       <span className="absolute right-1 top-1 flex items-center gap-0.5">
                         <span
-                          className="rounded bg-emerald-500/20 px-1 text-[9px] font-mono text-emerald-200 backdrop-blur"
-                          title="v3 角色一致性 prompt 已注入（character_locked=true）"
+                          className={`rounded px-1 text-[9px] font-mono backdrop-blur ${
+                            isNonProtagonistShot
+                              ? "bg-violet-500/30 text-violet-100"
+                              : "bg-emerald-500/20 text-emerald-200"
+                          }`}
+                          title={`v3 角色一致性 prompt 已注入（locked_character=${
+                            lockedCharacter || protagonistName || "?"
+                          }）`}
                         >
                           🔒
                         </span>
                         {ipAdapterUsed ? (
                           <span
                             className="rounded bg-violet-500/30 px-1 text-[9px] font-mono text-violet-100 backdrop-blur"
-                            title="v4 IP-Adapter 真接入：本镜把 character_anchor 喂给 image provider（ip_adapter_used=true）"
+                            title={`v4 IP-Adapter 真接入：本镜把 ${
+                              lockedCharacter || protagonistName || "anchor"
+                            } 的 anchor 喂给 image provider（ip_adapter_used=true）`}
                           >
                             IP
                           </span>
@@ -1387,6 +1504,16 @@ function StepArtifacts({
                     ) : null}
                     <div className="text-center text-[10px] text-muted-foreground">
                       shot {idx}
+                      {lockedCharacter && isNonProtagonistShot ? (
+                        <span
+                          className="ml-1 rounded bg-violet-500/15 px-1 text-[9px] text-violet-500"
+                          title={`v5 多角色：本镜锁定 ${lockedCharacter}（focus_character=${
+                            focusCharacter || lockedCharacter
+                          }）`}
+                        >
+                          {lockedCharacter}
+                        </span>
+                      ) : null}
                     </div>
                   </div>
                 );
@@ -2507,6 +2634,15 @@ function VideoArtifact({
   const anchorCount = rows.filter((r) => r.ref_image_source === "anchor").length;
   const keyframeCount = rows.filter((r) => r.ref_image_source === "keyframe").length;
   const noRefCount = rows.filter((r) => r.ref_image_source === "none").length;
+  // v5：anchor 镜的角色分布（多角色锁定时观察每角色被多少镜引用）
+  const anchorByRole: Record<string, number> = {};
+  for (const r of rows) {
+    if (r.ref_image_source === "anchor" && r.ref_anchor_role) {
+      anchorByRole[r.ref_anchor_role] = (anchorByRole[r.ref_anchor_role] ?? 0) + 1;
+    }
+  }
+  const anchorRoles = Object.keys(anchorByRole);
+  const isMultiCharacter = anchorRoles.length > 1;
 
   if (!rows.length) {
     return (
@@ -2528,13 +2664,24 @@ function VideoArtifact({
         {anchorCount + keyframeCount + noRefCount > 0 ? (
           <span
             className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-            title="ref-image 来源汇总：anchor=主角镜用全片锚点参考板，keyframe=每镜独立关键帧，none=无 ref（GENERATE_VIDEO 降级）"
+            title="ref-image 来源汇总：anchor=按 locked_character 选对应角色 anchor（v5），keyframe=每镜独立关键帧，none=无 ref（GENERATE_VIDEO 降级）"
           >
             ref:{" "}
             <span className="text-emerald-500">{anchorCount} anchor</span>
             {" · "}
             <span className="text-sky-500">{keyframeCount} keyframe</span>
             {noRefCount ? ` · ${noRefCount} none` : ""}
+          </span>
+        ) : null}
+        {isMultiCharacter ? (
+          <span
+            className="rounded bg-violet-500/15 px-1.5 py-0.5 text-[10px] text-violet-500"
+            title="v5 多角色锁定：anchor 按 shot.locked_character 逐镜选不同角色 anchor"
+          >
+            v5 ·{" "}
+            {anchorRoles
+              .map((role) => `${role}×${anchorByRole[role]}`)
+              .join(" / ")}
           </span>
         ) : null}
       </div>
@@ -2575,7 +2722,17 @@ function VideoArtifact({
               </div>
             )}
             <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-              <span>shot {r.index}</span>
+              <span>
+                shot {r.index}
+                {r.ref_image_source === "anchor" && r.ref_anchor_role ? (
+                  <span
+                    className="ml-1 rounded bg-emerald-500/15 px-1 text-[9px] text-emerald-500"
+                    title={`v5 多角色锁定：本镜 i2v 用了 ${r.ref_anchor_role} 的 anchor`}
+                  >
+                    {r.ref_anchor_role}
+                  </span>
+                ) : null}
+              </span>
               {r.duration_ms ? (
                 <span className="font-mono">{(r.duration_ms / 1000).toFixed(1)}s</span>
               ) : null}
@@ -2650,6 +2807,8 @@ interface VideoShotView {
   duration_ms: number;
   error: string | null;
   ref_image_source: RefImageSource;
+  // v5：source=='anchor' 时本镜真正用了哪个角色的 anchor（多角色锁定时关键观测点）
+  ref_anchor_role: string | null;
 }
 
 function readRefImageSource(
@@ -2668,6 +2827,17 @@ function readRefImageSource(
   return fallback.keyframe_url ? "keyframe" : "none";
 }
 
+function readRefAnchorRole(
+  raw: Record<string, unknown> | undefined,
+): string | null {
+  if (!raw) return null;
+  const v = raw.ref_anchor_role;
+  if (typeof v === "string" && v.trim()) {
+    return v.trim();
+  }
+  return null;
+}
+
 function toViewFromShotList(
   s: ShotOut,
   outputsRow: Record<string, unknown> | undefined,
@@ -2684,6 +2854,7 @@ function toViewFromShotList(
     ref_image_source: readRefImageSource(outputsRow, {
       keyframe_url: s.keyframe_url,
     }),
+    ref_anchor_role: readRefAnchorRole(outputsRow),
   };
 }
 
@@ -2702,6 +2873,7 @@ function toViewFromOutputs(s: Record<string, unknown>, i: number): VideoShotView
       typeof s.duration_ms === "number" ? (s.duration_ms as number) : 0,
     error: typeof s.error === "string" ? (s.error as string) : null,
     ref_image_source: readRefImageSource(s, { keyframe_url }),
+    ref_anchor_role: readRefAnchorRole(s),
   };
 }
 
