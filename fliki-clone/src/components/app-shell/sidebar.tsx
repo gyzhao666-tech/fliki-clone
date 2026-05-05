@@ -11,6 +11,7 @@ import {
   FolderOpen,
   Home,
   Library,
+  LineChart,
   Megaphone,
   Palette,
   PlaySquare,
@@ -133,6 +134,11 @@ export function Sidebar() {
                 href="/app/admin/feature-flags"
                 label="Feature Flags"
                 icon={ShieldCheck}
+              />
+              <NavLink
+                href="/app/admin/metrics"
+                label="Metrics"
+                icon={LineChart}
               />
             </div>
           </div>

@@ -236,3 +236,156 @@ async def cost_recent(
         raise HTTPException(status_code=503, detail=f"cost recent query failed: {exc}") from exc
 
     return RecentCallsOut(tenant_id=effective_tenant, items=items)
+
+
+# ── Track-21 · /timeseries（按天/按周 + provider 维度的时序聚合）────────────
+#
+# 设计取舍（与 /summary /recent 相互独立，不复用其 helper 状态）：
+#
+# - 复用既有 `_resolve_query_tenant` 鉴权 helper（admin 邮箱可指定他人 tenant；
+#   非 admin 静默覆盖回自己），与 /summary /recent 行为完全一致。
+# - **不**与 /summary 混合：那个端点是「截止此刻的本期累计 + 按 provider 拆分」，
+#   这个端点是「时序矩阵：每个 (bucket, provider) 一行」，前端 metric dashboard
+#   折线图直接消费；/summary 表头数字仍由原端点提供。
+# - **DATE_TRUNC 单位 whitelist**：只允许 'day' / 'week'，避免 SQL 注入风险也避免
+#   不可索引的桶（hour 级别另起 endpoint，本 v1 没需要）。
+# - **days 区间**：clamp 到 [1, 365]；前端默认 30，超过 365 风险是单 tenant 一年内
+#   model_calls 行数 × providers 行数过大；按 ix_model_calls_tenant_id 索引扫
+#   tenant + 时间过滤后，PG 内存能扛但前端折线无意义。
+# - **INTERVAL 参数化**：PG 不支持 `INTERVAL ':days days'` 直接绑定；用
+#   `(:days || ' days')::interval` 是社区最稳的安全形式。
+# - 空数据返空 items 列表（200），不返 404；前端可以画一个「最近 N 天无调用」空图。
+
+
+class CostTimeseriesPoint(BaseModel):
+    """单个 (bucket, provider) 的成本聚合点。"""
+
+    date: datetime = Field(..., description="DATE_TRUNC 后的桶起始时间（UTC）")
+    provider: str
+    cost_usd: float
+    call_count: int
+
+
+class CostTimeseriesOut(BaseModel):
+    tenant_id: str
+    period: str = Field(..., description="`daily` 或 `weekly`")
+    days: int = Field(..., description="实际查询的回看天数（已 clamp）")
+    provider_filter: Optional[str] = Field(
+        None,
+        description="若有 ?provider= 单一过滤，回显方便前端展示「仅 X」徽标",
+    )
+    period_start: datetime
+    period_end: datetime
+    total_cost_usd: float
+    total_calls: int
+    items: list[CostTimeseriesPoint]
+
+
+_BUCKET_BY_PERIOD = {"daily": "day", "weekly": "week"}
+
+
+def _resolve_bucket(period: str) -> str:
+    """把 ``period`` 字符串 whitelist 到 PG DATE_TRUNC 单位；非法 → daily 兜底。"""
+    return _BUCKET_BY_PERIOD.get((period or "daily").lower(), "day")
+
+
+def _clamp_days(days: int) -> int:
+    """clamp 到 [1, 365]；非整数 / 非法兜底回 30。"""
+    try:
+        n = int(days)
+    except (TypeError, ValueError):
+        return 30
+    return max(1, min(365, n))
+
+
+@router.get("/timeseries", response_model=CostTimeseriesOut)
+async def cost_timeseries(
+    current_user: CurrentUser,
+    tenant_id: Optional[str] = Query(
+        default=None,
+        description="目标 tenant；不传 = 调用方自己的（非 admin 传他人会被覆盖回自己）",
+    ),
+    provider: Optional[str] = Query(
+        default=None,
+        description="可选 provider 过滤（单值），不传 = 全部 provider",
+    ),
+    period: str = Query(
+        default="daily",
+        description="`daily` 按天聚合 / `weekly` 按周聚合",
+    ),
+    days: int = Query(
+        default=30,
+        ge=1,
+        le=365,
+        description="回看天数；clamp 到 [1, 365]",
+    ),
+) -> CostTimeseriesOut:
+    """按天 / 按周 × provider 的时序聚合，给 admin metrics 折线图用。"""
+    if period not in ("daily", "weekly"):
+        raise HTTPException(
+            status_code=400,
+            detail="period must be one of: daily / weekly",
+        )
+
+    effective_tenant = _resolve_query_tenant(
+        request_tenant_id=tenant_id, current_user=current_user
+    )
+    bucket = _resolve_bucket(period)
+    n_days = _clamp_days(days)
+    period_end = datetime.now(timezone.utc)
+    period_start = period_end - _timedelta(days=n_days)
+
+    # f-string 只内插 whitelist 后的 bucket（'day' / 'week'）;
+    # 其它都是绑定参数。
+    sql = text(
+        f"""
+        SELECT
+            DATE_TRUNC('{bucket}', created_at) AS day,
+            provider,
+            COALESCE(SUM(cost_usd), 0)::float AS cost_usd,
+            COUNT(*)::int AS call_count
+          FROM model_calls
+         WHERE tenant_id = :tenant_id
+           AND created_at >= NOW() - ((:days)::text || ' days')::interval
+           {"AND provider = :provider" if provider else ""}
+         GROUP BY day, provider
+         ORDER BY day ASC, provider ASC
+        """
+    )
+    params: dict[str, object] = {"tenant_id": effective_tenant, "days": n_days}
+    if provider:
+        params["provider"] = provider
+
+    items: list[CostTimeseriesPoint] = []
+    total_cost = 0.0
+    total_calls = 0
+    try:
+        engine = _engine()
+        with engine.connect() as conn:
+            for row in conn.execute(sql, params).mappings():
+                items.append(
+                    CostTimeseriesPoint(
+                        date=row["day"],
+                        provider=row["provider"],
+                        cost_usd=float(row["cost_usd"] or 0),
+                        call_count=int(row["call_count"] or 0),
+                    )
+                )
+                total_cost += float(row["cost_usd"] or 0)
+                total_calls += int(row["call_count"] or 0)
+    except Exception as exc:  # pragma: no cover - DB 故障翻 503，让前端空图
+        raise HTTPException(
+            status_code=503, detail=f"cost timeseries query failed: {exc}"
+        ) from exc
+
+    return CostTimeseriesOut(
+        tenant_id=effective_tenant,
+        period=period,
+        days=n_days,
+        provider_filter=provider,
+        period_start=period_start,
+        period_end=period_end,
+        total_cost_usd=round(total_cost, 6),
+        total_calls=total_calls,
+        items=items,
+    )
