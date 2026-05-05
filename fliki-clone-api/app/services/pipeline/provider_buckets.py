@@ -181,8 +181,15 @@ def acquire(
     provider_name: str,
     *,
     plan: str = "free",
+    user_id: Optional[str] = None,
 ) -> BucketSnapshot:
-    """获取一个槽位；失败抛 BucketFull。"""
+    """获取一个槽位；失败抛 BucketFull。
+
+    Track-25：桶满时在 `user:{user_id}` 频道推一条 `bucket_full` 事件，让前端
+    layout.tsx 全局 hook 用 `feedback.warning` 提示「Provider {name} 并发到上限」。
+    `user_id` 缺省 None 时保留向后兼容（gateway 内部从 `request.user_id` 透传，
+    其他调用方可不传）。
+    """
     if not tenant_id:
         raise ValueError("tenant_id required")
 
@@ -196,6 +203,38 @@ def acquire(
     snap = _try_acquire(tenant_id, provider_name)
     if snap is not None:
         return snap
+
+    # 桶满：先广播再抛，event 路径失败不影响 caller 拿到 BucketFull
+    if user_id:
+        try:
+            from . import events as pipeline_events
+
+            pipeline_events.publish_user_event(
+                user_id,
+                "bucket_full",
+                {
+                    "tenant_id": tenant_id,
+                    "kind": "provider_bucket",
+                    "provider_name": provider_name,
+                    "message": (
+                        f"Provider {provider_name} 并发到上限"
+                        + (
+                            f" ({pre.current_in_flight}/{pre.max_concurrent})"
+                            if pre
+                            else ""
+                        )
+                    ),
+                    "current_in_flight": int(pre.current_in_flight) if pre else None,
+                    "max_concurrent": int(pre.max_concurrent) if pre else None,
+                },
+            )
+        except Exception:  # pragma: no cover - publish 失败不阻断 BucketFull 主流程
+            logger.warning(
+                "publish_user_event bucket_full failed user=%s tenant=%s provider=%s",
+                user_id,
+                tenant_id,
+                provider_name,
+            )
 
     raise BucketFull(tenant_id, provider_name, snapshot=pre)
 

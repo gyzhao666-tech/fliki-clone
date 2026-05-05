@@ -392,8 +392,15 @@ def reserve_tenant(
     *,
     plan: str = "free",
     display_name: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> ReserveResult:
-    """tenant 级 reserve。匿名 tenant 直接放行不落库。"""
+    """tenant 级 reserve。匿名 tenant 直接放行不落库。
+
+    Track-25：超限时（router 即将 raise 402）先在 `user:{user_id}` 频道推一条
+    `quota_exceeded` 事件，让前端 layout.tsx 全局 hook 在 toast 上即时反馈
+    「月度额度不足」，避免用户对着 402 错误页面发懵。`user_id` 缺省 None 时
+    保留向后兼容（旧调用方 / 老脚本不会被打断）。
+    """
     if amount < 0:
         return ReserveResult(ok=False, reason="amount must be non-negative")
     snap = get_or_create_tenant(tenant_id, plan=plan, display_name=display_name)
@@ -417,6 +424,32 @@ def reserve_tenant(
         limit = float(row[0])
         usage = float(row[1])
         if usage + amount > limit + 1e-6:
+            # Track-25：抛 402 之前推 user-level 事件，让前端立即看到 toast
+            if user_id:
+                try:
+                    from . import events as pipeline_events
+
+                    pipeline_events.publish_user_event(
+                        user_id,
+                        "quota_exceeded",
+                        {
+                            "tenant_id": tenant_id,
+                            "kind": "monthly_quota",
+                            "message": (
+                                f"月度额度不足：需要 ${amount:.4f}，已用 ${usage:.4f}/"
+                                f"${limit:.2f}"
+                            ),
+                            "attempted_cost": float(amount),
+                            "monthly_limit": float(limit),
+                            "current_usage": float(usage),
+                        },
+                    )
+                except Exception:  # pragma: no cover - publish 失败不阻断 quota 主流程
+                    logger.warning(
+                        "publish_user_event quota_exceeded failed user=%s tenant=%s",
+                        user_id,
+                        tenant_id,
+                    )
             return ReserveResult(
                 ok=False,
                 reason=(

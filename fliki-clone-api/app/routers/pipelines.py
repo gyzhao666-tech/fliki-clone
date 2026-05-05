@@ -258,9 +258,16 @@ async def start_pipeline(
         )
 
     # ── 3) 配额预扣（reserve = total_usd）
+    # Track-25：把 current_user.id 透传给 reserve_tenant，超限时它会先在
+    # `user:{user_id}` 频道推 quota_exceeded 事件再让 router 抛 402，让前端
+    # 全局 hook 立刻弹 toast，避免「点了启动突然 402」的困惑。
     reserved = float(estimate["total_usd"])
     rr = reserve_tenant(
-        tctx.tenant_id, reserved, plan=tctx.plan, display_name=tctx.display_name
+        tctx.tenant_id,
+        reserved,
+        plan=tctx.plan,
+        display_name=tctx.display_name,
+        user_id=current_user.id,
     )
     if not rr.ok:
         raise HTTPException(status_code=402, detail=rr.reason or "quota check failed")
@@ -670,6 +677,133 @@ def _resolve_step_id(run_id: str, name: str) -> str:
     if not row:
         raise HTTPException(status_code=404, detail=f"step '{name}' not found")
     return row[0]
+
+
+# ── Track-25：用户级 SSE（quota_exceeded / bucket_full） ─────────────────────
+# 协议：
+#   event: snapshot           data: <UserSnapshotOut JSON>     连接首条；当前 quota / 桶状态
+#   event: quota_exceeded     data: {tenant_id, kind, message, attempted_cost,
+#                                    monthly_limit, current_usage}
+#   event: bucket_full        data: {tenant_id, kind, provider_name, message,
+#                                    current_in_flight, max_concurrent}
+#   :ping                                                       注释行 heartbeat（25s）
+#
+# 与 `/api/pipelines/{run_id}/events` 不同：本端点是「全局长连接」，没有终态，
+# 浏览器原生 EventSource 离线重连时也会带 `Last-Event-ID`，redis Stream 续推。
+# 30 分钟兜底关闭一次（防 nginx 超时 / 进程卡死），客户端会自动重连。
+
+
+def _user_snapshot_payload(current_user, tctx, snap, active, buckets) -> dict[str, Any]:
+    """连接时一次性的 quota + bucket 全量；与 `/quota` + `/buckets` 字段对齐。"""
+
+    return {
+        "user_id": current_user.id,
+        "tenant_id": tctx.tenant_id,
+        "tenant_plan": tctx.plan,
+        "tenant_display_name": snap.display_name or tctx.display_name,
+        "monthly_limit_usd": snap.monthly_limit_usd,
+        "current_period_usage_usd": snap.current_period_usage_usd,
+        "remaining_usd": snap.remaining_usd,
+        "concurrent_max": snap.concurrent_max,
+        "active_runs": active,
+        "provider_buckets": [
+            {
+                "provider_name": b.provider_name,
+                "current_in_flight": b.current_in_flight,
+                "max_concurrent": b.max_concurrent,
+                "remaining": b.remaining,
+                "utilization_pct": round(b.utilization_pct, 1),
+            }
+            for b in buckets
+        ],
+    }
+
+
+async def _user_events_sse_stream(
+    user_id: str,
+    request: Request,
+    snapshot_payload: dict[str, Any],
+    *,
+    last_event_id: str | None = None,
+) -> AsyncIterator[str]:
+    """长连接 SSE：snapshot → 订阅 user channel → 增量推。
+
+    与 pipeline run SSE 的差异：
+    - 没有「run 进入终态自动关闭」逻辑；只到 30 分钟兜底 / 客户端断开
+    - 任何 redis 抖动 / subscribe init 失败都安静关闭，浏览器自动重连
+    """
+
+    yield _sse_format("snapshot", snapshot_payload)
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _SSE_MAX_DURATION_SEC
+    last_hb = loop.time()
+    sub_iter = pipeline_events.subscribe_user(
+        user_id, last_event_id=last_event_id, stop_event=stop_event
+    )
+
+    try:
+        async for tick_msg in sub_iter:
+            now = loop.time()
+            if now > deadline:
+                return
+            if await request.is_disconnected():
+                return
+
+            if tick_msg is None:
+                if now - last_hb >= _SSE_HEARTBEAT_SEC:
+                    yield ": ping\n\n"
+                    last_hb = now
+                continue
+
+            event_type, payload, event_id = tick_msg
+            yield _sse_format(event_type, payload, event_id=event_id)
+            last_hb = now
+    finally:
+        stop_event.set()
+        try:
+            await sub_iter.aclose()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+@router.get("/user-events")
+async def user_events_stream(
+    current_user: CurrentUser,
+    request: Request,
+):
+    """订阅当前登录用户的事件流（quota_exceeded / bucket_full）。
+
+    全局 layout.tsx 挂 hook 即可监听，所有页面都能收到 toast；不需要每个
+    pipeline 页面单独订阅。
+    """
+
+    tctx = pipeline_tenant.resolve_tenant_context(
+        current_user.id, user_plan=getattr(current_user, "plan", None) or "free"
+    )
+    snap = get_or_create_tenant(
+        tctx.tenant_id, plan=tctx.plan, display_name=tctx.display_name
+    )
+    active = count_active_runs_tenant(tctx.tenant_id)
+    buckets = pipeline_buckets.list_buckets(tctx.tenant_id)
+    snapshot_payload = _user_snapshot_payload(current_user, tctx, snap, active, buckets)
+
+    last_event_id = request.headers.get("Last-Event-ID") or None
+    return StreamingResponse(
+        _user_events_sse_stream(
+            current_user.id,
+            request,
+            snapshot_payload,
+            last_event_id=last_event_id,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
 
 
 # 触发 execute_step 名称导出，便于 Phase 2 切到 Celery 时 import

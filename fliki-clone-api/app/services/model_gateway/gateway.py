@@ -139,6 +139,7 @@ class Gateway:
                     effective_tenant_id,
                     provider.name.value,
                     plan=effective_plan,
+                    user_id=request.user_id,
                 )
                 bucket_acquired = True
                 bucket_tenant_id = effective_tenant_id
