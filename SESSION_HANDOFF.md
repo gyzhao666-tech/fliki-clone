@@ -1,7 +1,20 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 并行第一波 7 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 并行第一波 7 Track + 第二波 4 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 13:55 更新：**多 Agent 第二波 4 Track 已合并到 main**（`pytest 41/41 PASS`）。
+> 合并顺序：T11 → T03 → T09 → T10（最后合 T10 解 art.py canary × 多角色叠加冲突）。
+> 新 alembic head: **`a1b2c3d4e5f6`**（顶 `9c2d4e5f6a7b`，`feature_flags` 表）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 03 publish 异步化 | `POST /publish-plans/{id}/execute` 默认返 202+`events_url` 走 celery（`?sync=true` 兜底走 v1 同步）；新 SSE `GET /publish-plans/{id}/events`：`snapshot`+`publish_plan_state(running\|completed\|system_error)`+25s ping；celery task `publish.execute_plan`（queue=default）；BackgroundTasks fallback 共用同一 task body | `services/pipeline/{events,tasks,celery_app}.py` + `routers/production.py` + 新 `hooks/use-publish-plan-stream.ts` + PlanRow 行内 stream/poll 徽标 + Loader spin |
+> | 09 多角色锁定 v5 | ArtAgent 从「只锁主角」升级为「每个 character_card 各一份 anchor」+「按 `shot.focus_character` 逐镜选对应 anchor」；VideoAgent `_select_ref_image` 跟着按角色选；outputs 加 `character_anchors`/`shots[i].locked_character`/`ref_anchor_role`/`ref_image_summary.by_role`（`character_anchor` 单字段保留为主角的，v3/v4 兼容）；前端 ArtArtifact 多角色 grid（主角 emerald / 配角 violet 边框）+ shots 网格 🔒 角标按角色着色；VideoArtifact 头部按角色统计 | `services/pipeline/agents/{art,video}.py` + `pipeline/page.tsx::{ArtArtifact,VideoArtifact}` + 新 `tests/test_track09_multichar.py` (6 case) |
+> | 10 灰度发布 / canary | 新表 `feature_flags(tenant_id, flag_name, value_json)` + 唯一约束 `(tenant_id, flag_name)`；`feature_flags.is_enabled` 支持 `{"pct":0..100}`/`{"enabled":bool}`/`{"variant":...}` 三形态；hash SHA-1 前 8 hex mod 100 跨进程稳定；ArtAgent 入口读 `art_ipadapter_pct` 决定 v4 / v3-prompt-only；outputs 加 `canary_variant` + `canary_flag_value`；admin 路由 `/api/admin/feature-flags`（邮箱白名单） | alembic `a1b2c3d4e5f6` + `models/feature_flag.py` + `services/pipeline/feature_flags.py` + `routers/admin_flags.py` + `runner.execute_step` 注入 `ctx.feature_flags` + `agents/art.py` 入口闸门 |
+> | 11 Stripe 计费 v2 | 6 路由 `/api/billing/{plan,checkout-session,portal-session,checkout(legacy),portal(legacy),webhook}`；`services/billing/{stripe_client,webhook_handlers,tenant_sync}.py` 三模块；`quota.update_tenant_plan(tenant_id, new_plan)` 联动 `tenant_quotas` + 遍历 provider buckets `ensure_bucket(plan=new)` bump；webhook 处理 `checkout.session.completed` / `customer.subscription.{updated,deleted}` / `invoice.payment_failed` 4 事件；前端 `/app/billing` 三栏 plan 卡片 + Stripe Checkout/Portal 跳转 | `routers/billing.py` 重写 + `services/billing/*` + `pipeline/quota.py` + 新 `app/billing/page.tsx` + `.env.example`（`STRIPE_PRICE_*`） |
+>
+> **能力扩展**：发布执行从同步 30-60s 卡 HTTP 升级到异步 202+SSE；角色一致性从「主角 prompt+anchor」升级为「多角色逐镜锁定」；ArtAgent v4 上线 canary 灰度（按 tenant_id hash 染色 0-100%）；Stripe 真支付链路打通（webhook 落 tenant_quotas + provider bucket bump）。
 
 > 2026-05-05 12:35 更新：**多 Agent 第一波 7 Track 已合并到 main**（`pytest 31/31 PASS`）。
 > 仓库已 push 到 GitHub: https://github.com/gyzhao666-tech/fliki-clone
@@ -88,11 +101,30 @@
 
 ## 2026-05-05 当前进程（最新）
 
-- **后端 pid 59135**（启于 2026-05-05 11:13；监听 `127.0.0.1:8000`，无 proxy 污染；
-  **重启后** alembic head `9c2d4e5f6a7b`；已加载配额 v2 + VoiceAgent v4 +
-  ArtAgent v3/v4 IP-Adapter + 发布执行器 v1 含 confirm_real_publish 列 +
-  faster-whisper 本地 fallback + Fernet 凭证加密）
-- **前端 pid 5186**（next dev，3000 端口，hot-reload 改动无需重启）
+- **后端 pid 30876**（仍在 11:13 启的进程；监听 `127.0.0.1:8000`，无 proxy 污染；
+  代码改了未重启 → **下次重启就会加载第二波 4 Track 新代码 + alembic head `a1b2c3d4e5f6`**；
+  已落库的能力：配额 v2 / VoiceAgent v4 / ArtAgent v3+v4 IP-Adapter / 发布执行器 v1
+  含 confirm_real_publish 列 / faster-whisper 本地 fallback / Fernet 凭证加密）
+- **前端 pid 8947**（next dev，3000 端口，hot-reload 改动无需重启；
+  第二波 4 Track 的前端改动会自动 hot-reload）
+
+**第二波合并后必做**：
+
+```bash
+# 1. 停旧 backend（pid 30876）
+kill 30876
+
+# 2. 跑 alembic（如果你跨过 12:35 没启过新 backend，就把 feature_flags 迁移落库）
+cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
+  .venv/bin/python -m alembic upgrade head   # → a1b2c3d4e5f6
+
+# 3. 启新 backend（不带 --reload）
+cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
+  .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 4. 验证（应看到 119 routes / 6 billing / 4 admin-flag / SSE publish-events）
+.venv/bin/python -c "from app.main import app; print(len(app.routes))"
+```
 
 **重要**：用户自己重启 backend 时记得 `cd /Users/zhaoguangyuan/project/empty/fliki-clone-api &&
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000`（不带 `--reload`），
@@ -355,6 +387,10 @@ Brief
 | **VoiceAgent v4 word-level 强对齐** | ✅ | OpenAI Whisper-1 返 `words` 时进入 v4：`_build_subtitles_v4_word_aligned` 按字符比例做 origin↔asr 文本映射，每条 line 的 start/end 用真实 word timestamp；line.words 给前端做卡拉 OK 高亮；健康检查降级（words 太少 / 字符比例严重失调 → 退 v3）；前端 violet「word v4」徽标 + 字幕条 word 时间轴卡片；6 个烟测 PASS。**激活**：`.env` 配 `OPENAI_API_KEY`，无 key 时 v3 行级继续工作 |
 | **ArtAgent v3 角色一致性** | ✅ | 双层方案：(1) `_generate_character_anchor` 单独出主角 1:1 参考板（`outputs.character_anchor.url`，未来给 IP-Adapter 用）；(2) `_inject_consistency_into_shots` 把 `[Consistent character: protagonist=...; appearance=...; wardrobe=...]` 强制注入每镜 `enhanced_prompt`，`negative_prompt` 追加防漂关键词；`brief.character_consistency`：`auto`/`prompt-only`/`anchor`/`off`；`brief.protagonist_role` 显式选主角；锚点失败 mode=anchor 自动降到 prompt-only；前端 v3 徽标 + 锚点缩略图 panel + shots 网格 🔒 角标；8 个烟测 PASS |
 | **发布执行器 v1（dry-run / youtube / bilibili）** | ✅ | `app/services/publishing/`：adapter 协议 + dry-run（始终启用，回 mock external_id）/ youtube（真发，需 GOOGLE_CLIENT_ID + OAuth + 安全闸门 `plan.meta.confirm_real_publish=true`）/ bilibili（stub，引导手动上传）+ executor + credentials + oauth helpers；`POST /api/production/publish-plans/{id}/execute` 调入；`GET/DELETE /api/production/platforms/credentials`；`POST /api/production/platforms/{p}/oauth/start` + `GET /api/production/platforms/{p}/oauth/callback`（YouTube）；系统级异常（PublishError）入 DLQ + 502；幂等性：已 `published` 的 plan 拒绝重发；前端 PlanRow 加 Upload 按钮 + plan.error 显示 + external_id；新 `<PlatformCredentialsPanel>`（real/stub 徽标 + 绑定/撤销按钮）；4 场景端到端 PASS |
+| **publish 任务异步化（celery + SSE）** | ✅ | Track-03：`POST /publish-plans/{id}/execute` 默认返 **202 + dispatcher + events_url + Location 头**（`?sync=true` 兼容兜底走 v1 同步路径）；celery task `publish.execute_plan`（queue=default，`acks_late=True`），BackgroundTasks fallback 共用同一 task body 函数保证 SSE 事件流语义一致；新 SSE 端点 `GET /publish-plans/{id}/events`：`event: snapshot` + `event: publish_plan_state phase=running\|completed\|system_error` + 25s `: ping` 心跳；`events.py` 抽出 `_publish_to_channel` / `_subscribe_channel` 内核让 `publish:plan:{id}` 与 `pipeline:run:{id}` 复用同一份 redis pub/sub；前端新 hook `use-publish-plan-stream.ts`（EventSource + 2 次 onerror fallback 2.5s polling），PlanRow 行内 stream/poll 徽标 + `<Loader2 spin>` + 终态 toast；4 路径函数级 + 1 路径队列级烟测 PASS（HTTP TestClient 因 sandbox event loop 没跑，留给真启 backend 后人工 curl）|
+| **多角色锁定 v5（ArtAgent + VideoAgent）** | ✅ | Track-09：v3/v4 只锁主角；v5 升级为「每个 character_card 各一份 anchor」+「按 `shot.focus_character` 逐镜选对应 anchor + 注入对应前缀」；`_select_relevant_characters`（主角永远保留；其余角色被 focus 引用才纳入，不浪费 image 调用）→ `_generate_character_anchors`（批量出 anchor，单个失败不影响其它）→ `_inject_consistency_into_shots(characters_by_name=)`；`_generate_keyframes(anchors_by_role=)` 多角色 anchor URL 字典；VideoAgent `_select_ref_image` 按 `shot.locked_character` / `focus_character` 选对应 anchor，返 `(url, source, anchor_role)`；outputs 新增 `character_anchors`/`shots[i].locked_character`/`ref_anchor_role`/`ref_image_summary.by_role`/`character_anchors_by_role`；前端 ArtArtifact 多角色 grid（主角 emerald / 配角 violet 边框）+ shots 网格 🔒 角标按 `locked_character` 着色；VideoArtifact 头部按角色统计 + 每镜 `ref_anchor_role` 角标；`character_anchor` 单字段保留为主角的（向后兼容前端 v3 徽标 / 旧 video.py）；6 case + 既有 31 case 零回归 |
+| **canary 灰度 / feature_flags v1** | ✅ | Track-10：新表 `feature_flags(id, tenant_id, flag_name, value_json, created_at, updated_at)` + 唯一约束 `(tenant_id, flag_name)`（alembic `a1b2c3d4e5f6`）；`services/pipeline/feature_flags.py`：`get_flag`/`set_flag`（PG `ON CONFLICT` upsert）/`load_for_tenant`（runner build ctx 时一次性批量）/`is_enabled`；value 形态 `{"pct":0..100}`（hash SHA-1 前 8 hex mod 100，bucket < pct 命中）/`{"enabled":bool}`/`{"variant":"v4"/"v3"/"off"}`；`PipelineContext` 加 `feature_flags`/`tenant_id`/`tenant_plan`；ArtAgent 入口读 `art_ipadapter_pct`：缺省→默认 v4；命中→喂 anchor 走 v4 IP-Adapter；不命中→`anchors_url_by_role={}` 主角镜降到 v3 prompt-only（前缀注入仍生效）；outputs 加 `canary_variant`/`canary_flag_value` 可观测；admin 路由 `GET/PUT/DELETE /api/admin/feature-flags`（邮箱白名单 `ADMIN_EMAILS=...`，fallback `demo@example.com`）；4 case 叠加 multichar 烟测 + service 层 hash 染色稳定性烟测 PASS |
+| **Stripe 计费对接 v2 + tenant_quotas 同步** | ✅ | Track-11：6 路由 `/api/billing/{plan,checkout-session,portal-session,checkout(legacy),portal(legacy),webhook}`；`services/billing/`：`stripe_client.py`（薄封装 SDK + `StripeNotConfigured` 翻 503）/`webhook_handlers.py`（4 事件矩阵：`checkout.session.completed` / `customer.subscription.{updated,deleted}` / `invoice.payment_failed`）/`tenant_sync.py`（`sync_user_plan(user_id, new_plan)` 走 `pipeline.tenant.resolve_tenant_id` → `quota.update_tenant_plan`）；`quota.update_tenant_plan(tenant_id, new_plan)` 新加：UPDATE `tenant_quotas.plan` + 升级取 `PLAN_DEFAULTS` bump `monthly_limit_usd`/`concurrent_max`（降级**保留**运维手调过的值）+ 遍历 `provider_concurrency_buckets` 调 `ensure_bucket(plan=new)` 自动 bump per-provider max_concurrent；新前端 `/app/billing` 三栏 plan 卡片（free/standard/premium）+ Active 徽章 + 「升级」跳 Stripe Checkout / 「管理订阅」跳 Customer Portal；`?session_id=` 跳回参数 1.5s 后 refetch；不动 alembic（复用现有 `subscriptions`/`tenant_quotas`/`provider_concurrency_buckets`）；handler dispatch + tenant_sync 单元烟测 PASS（真 Stripe CLI 联调要本地配 `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` 后跑 `stripe trigger checkout.session.completed`）|
 
 ---
 
@@ -419,20 +455,25 @@ cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && make pipeline-worker
 
 | 优先级 | 任务 | 工作量 | 触发条件 / 价值 |
 |---|---|---|---|
-| ~~★★★~~ ✅ | ~~VoiceAgent v2 字幕对齐~~ | ~~1 天~~ | **2026-05-04 22:00 完成** |
+| ~~★★★~~ ✅ | ~~VoiceAgent v2/v3/v4 字幕对齐 + word-level~~ | ~~2 天~~ | **2026-05-04 22:00 / 22:30 / 05-05 10:00 完成** |
 | ~~★★~~ ✅ | ~~DLQ 前端列表~~ | ~~半天~~ | **2026-05-04 21:00 完成** |
-| ~~★★★~~ ✅ | ~~VoiceAgent v3 行级细切~~ | ~~半天~~ | **2026-05-04 22:30 完成** |
-| ~~★★~~ ✅ | ~~VoiceAgent v4 word-level 强对齐~~ | ~~半天~~ | **2026-05-05 10:00 完成**：算法+集成 6/6 PASS；激活需 `.env` OPENAI_API_KEY |
-| ~~★★~~ ✅ | ~~发布执行器 v1~~ | ~~1.5 天~~ | **2026-05-05 11:30 完成**：dry-run / youtube / bilibili adapter + executor + OAuth + 前端 |
-| ~~★~~ ✅ | ~~ArtAgent v3 角色一致性~~ | ~~1 天~~ | **2026-05-05 10:45 完成**：锚点参考板 + prompt 锁定 + 防漂；8/8 PASS |
-| ~~★~~ ✅ | ~~配额 v2 tenant 级分桶~~ | ~~半天~~ | **2026-05-05 09:30 完成**：tenant + provider 并发分桶；6/6 PASS + 端到端 |
-| ★★ | **YouTube 真发安全闸门 + 前端开关** | 半天 | 当前 v1 默认走「假发」（只回 mock external_id）；要走真发需 `plan.meta_json.confirm_real_publish=true`，前端没暴露这个 toggle，加一个 ProductionPanel「确认真发」按钮 + alembic 加 `publish_plans.confirm_real_publish` 列（避免 meta_json 隐藏字段）；同时把 YouTube resumable upload 改成 chunked PUT，避免 1080p 视频超 timeout |
-| ★★ | **凭证加密** | 半天 | `platform_credentials.access_token / refresh_token` 当前 plain text；加 Fernet 对称加密，密钥从 `.env` 读；`.env` 加 `PUBLISH_CREDENTIAL_FERNET_KEY=` 字段 |
-| ★ | **前端 Pipeline DAG 视图** | 1 天 | react-flow + 版本切换 + 平台预览 |
-| ★ | **SSE 增强** | 0.5 天 | 当前 `: ping` 心跳 + onerror fallback 已经够用；后续可加 `last_event_id` 让断网重连续传 |
-| ★ | **ArtAgent v4：IP-Adapter / Flux Redux 真接入** | 1.5 天 | v3 锚点 URL 已写好但还没塞回 image provider；当 SiliconFlow Kolors-IP 端点 / Flux Redux 启用时，`_generate_keyframes` 读 `outputs.character_anchor.url` 作为 `image_url` 传入，达到真正的 IP-Adapter 一致性 |
-| ★ | **bilibili 自动发布**（受限）| 2-3 天（含合规） | 需要 MCN/合作伙伴入驻拿 OpenAPI；技术层 stub 已留好（`adapters/bilibili.py`），落地是商务问题 |
-| ★ | **publish 任务异步化** | 半天 | 当前 `/publish-plans/{id}/execute` 同步等 adapter 返；YouTube 真发可能 30-60s，建议入 celery 队列异步 + SSE 推 plan_state |
+| ~~★★~~ ✅ | ~~发布执行器 v1 + Track-01 凭证 Fernet 加密 + Track-02 confirm_real_publish 列~~ | ~~2 天~~ | **2026-05-05 11:30 完成** |
+| ~~★~~ ✅ | ~~ArtAgent v3 + v4 IP-Adapter 接入点 + Track-09 多角色锁定~~ | ~~2 天~~ | **2026-05-05 10:45 + 13:55 完成** |
+| ~~★~~ ✅ | ~~配额 v2 tenant 级分桶~~ | ~~半天~~ | **2026-05-05 09:30 完成** |
+| ~~★★~~ ✅ | ~~publish 任务异步化（celery + SSE）~~ | ~~半天~~ | **2026-05-05 13:55 完成（Track-03）**：202 + dispatcher + SSE phase 流；BackgroundTasks fallback 共用 task body |
+| ~~★★~~ ✅ | ~~canary / feature_flags v1~~ | ~~1.5 天~~ | **2026-05-05 13:55 完成（Track-10）**：alembic `a1b2c3d4e5f6`；ArtAgent 入口闸门 + admin 路由 |
+| ~~★★~~ ✅ | ~~Stripe 计费 v2~~ | ~~2 天~~ | **2026-05-05 13:55 完成（Track-11）**：6 路由 + webhook 4 事件矩阵 + tenant_quotas/provider buckets bump |
+| ★★ | **YouTube 真发 chunked PUT + 真账号 e2e** | 半天 | 当前 youtube adapter 用 resumable upload 一把发；1080p 大文件可能超 timeout；改 chunked 8-16MiB PUT，加进度回写 `plan.meta_json.upload_progress`；同时跑一次真 OAuth + 真上传 + 真 video_id 落 `external_id` 闭环 |
+| ★ | **前端 Admin · Feature Flags 管理面板** | 1 天 | Track-10 当前只暴露 HTTP API；前端在 settings 加一个 tab：列 tenant 全部 flag + 滑块改 pct + Apply；带 audit log 展示（who / when / from / to） |
+| ★ | **DLQ retry 识别 publish.execute_plan** | 1-2 小时 | Track-03 follow-up：当前 DLQ retry 走 `_retry_dispatch(tick_task)`，对 publish task 不生效；在 `routers/dlq.py::retry` 识别 `task_name="publish.execute_plan"` 时改派 `execute_publish_plan_task.delay(*args)` |
+| ★ | **Stripe webhook handler 单元测试 + 失败支付路径** | 半天 | Track-11 follow-up：模拟 stripe Event payload 跑 `handle_webhook_event` 断言 DB 变化；补 `charge.refunded` 处理（v1 故意没接） |
+| ★★ | **bilibili 自动发布**（依赖商务）| 2-3 天 | Track-12：等 MCN/合作伙伴入驻拿 OpenAPI；adapter stub 已留好 |
+| ★ | **SSE 断网重连续传** | 半天 | 当前 `: ping` + onerror fallback 已够用；加 `last_event_id` 让客户端断网重连不丢事件（pipeline + publish 两条 SSE 一起做） |
+| ★ | **ArtAgent v4 多角色 IP-Adapter 真接入** | 1-1.5 天 | Track-09 已把 anchors_by_role 喂进 `_generate_keyframes(image_url=)`；等 SiliconFlow Kolors-IP / Flux Redux 上 multi-IP 端点后，改 `siliconflow_image.py` 兼容多 ref，agents 不动 |
+| ★ | **L-04 月账单 PDF + 邮件** | 1 天 | Track-11 follow-up：拿 stripe `invoice.paid` 渲染 PDF + 邮件 |
+| ★ | **L-05 RBAC：workspace member editor/viewer 权限** | 1.5 天 | Track-10 admin 路由当前是邮箱白名单，正经 RBAC 还没做 |
+| ★ | **L-11 model_calls 加 tenant_id + 按 tenant 聚合** | 半天 | 配额 v2 落地后，`model_calls` 表还在按 user 聚合；改成 tenant 维度成本看板 |
+| ★ | **L-12 前端 i18n 完整覆盖** | 1.5 天 | 当前 zh/en 部分页面有缺失 |
 
 > 不建议下次先做：langgraph 整体替换（见 ADR-002）。
 
@@ -453,7 +494,8 @@ fliki-clone-api/
 │   ├── 20260504_2030_add_dead_letter_tasks.py  (rev e58c4a1d2b73)
 │   ├── 20260505_0900_add_tenant_quota_and_provider_buckets.py (rev c2f9b7a04ef1)
 │   ├── 20260505_1100_add_platform_credentials.py (rev 8b1f6c2d4a93)
-│   └── 20260505_1200_add_publish_plan_confirm_real.py (rev 9c2d4e5f6a7b)  ← head
+│   ├── 20260505_1200_add_publish_plan_confirm_real.py (rev 9c2d4e5f6a7b)
+│   └── 20260505_1300_add_feature_flags.py (rev a1b2c3d4e5f6)  ← head ★ Track-10
 ├── app/
 │   ├── main.py
 │   ├── config.py
@@ -571,22 +613,25 @@ Redis 在跑（`redis-cli ping → PONG`）。
 ## 10. 一句话开局（贴到下个会话）
 
 ```
-延续 2026-05-04 + 05-05 会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
-当前能跑 video_full 端到端：字幕硬烧 / 配额 v2 tenant 级分桶 + provider 并发桶 / Celery 双模式 /
-SSE 流式状态 / EditAgent v5 / VoiceAgent v4 word-level 强对齐（OpenAI Whisper 或本地 faster-whisper）/
-ArtAgent v3+v4 角色一致性（锚点参考板 + prompt 锁定 + IP-Adapter 接入点）/ VideoAgent v2（i2v 主参考帧用 anchor）/
-ADR-002 / 数据模型扩展 v1（10 表 + persist 双写 + 生产 router）/ 前端切 /api/production/* +
-Tenant 视图 + Provider 桶 + 版本 / 发布 panel + DLQ panel + DAG 视图 + 角色一致性 / 字幕 word 时间轴 /
-发布执行器 v1（dry-run / youtube / bilibili adapter + executor + OAuth + PlatformCredentialsPanel +
-publish_plans.confirm_real_publish 列 + Fernet 凭证加密）/ pytest 31 case 全过。
+延续 2026-05-04 + 05-05 全天会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
 仓库：https://github.com/gyzhao666-tech/fliki-clone（monorepo）。
-请直接做：(A) Track-03 publish 任务异步化（celery + SSE plan_state，半天）；
-(B) Track-09 多角色锁定（依赖 Track-04，1 天）；
-(C) Track-10 灰度发布 / canary（依赖 Track-01，1.5 天）；
-(D) Track-11 Stripe 计费对接（依赖 Track-01，2 天）。除非我另说。
-开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 9c2d4e5f6a7b；
-            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 31 PASS；
-            (5) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
+当前能跑 video_full 端到端：配额 v2 tenant + provider 桶 / VoiceAgent v4 word-level
+（OpenAI Whisper 或本地 faster-whisper）/ ArtAgent v3+v4+v5（多角色 anchor 锁定，按
+shot.focus_character 逐镜选 + canary 灰度按 tenant_id hash 染色 v4↔v3-prompt-only）/
+VideoAgent v2 i2v 多角色 anchor / EditAgent v5 / 发布执行器 v1（dry-run/youtube/bilibili，
+含 confirm_real_publish 列 + Fernet 凭证加密 + OAuth）+ publish 任务异步化（celery + SSE
+phase 流）/ feature_flags v1 + admin 路由 / Stripe 计费 v2（webhook 落 tenant_quotas +
+provider bucket bump）/ DAG 视图 / pytest 41 case 全过。
+请直接做（除非我另说）：
+(A) YouTube 真发 chunked PUT + 真账号 e2e（半天）；
+(B) 前端 Admin · Feature Flags 管理面板（1 天）；
+(C) DLQ retry 识别 publish.execute_plan task（1-2 小时）；
+(D) Stripe webhook handler 单元测试 + charge.refunded（半天）；
+(E) bilibili 自动发布（等 MCN，2-3 天，商务问题）。
+开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 a1b2c3d4e5f6；
+            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 41 PASS；
+            (5) 重启 backend 才会加载第二波 4 Track 新代码；
+            (6) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
 ```
 
 ## 11. 怎么试 v4 多比例（最快）

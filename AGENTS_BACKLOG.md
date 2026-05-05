@@ -1,25 +1,27 @@
-# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 Track 已合并）
+# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 Track + 第二波 4 Track 全部已合并）
 
 > 这份是**给每个 Cursor Agent Window 看的**：进入仓库第一件事 read 这份，找你的 Track，按规则执行。
 > 协调者：人类（用户）；分支合并、SESSION_HANDOFF.md 更新由人类（或最后一个 agent）统一负责。
 
-## 0. 仓库 / 进程现状（2026-05-05 12:42 更新）
+## 0. 仓库 / 进程现状（2026-05-05 13:55 更新）
 
 - **GitHub**：https://github.com/gyzhao666-tech/fliki-clone（monorepo：`fliki-clone-api/` + `fliki-clone/`）
 - **本地仓库根**：`/Users/zhaoguangyuan/project/empty/`
-- **基线**：`main` @ `be674e7 chore(merge): 整理多 Agent 第一波 7 Track 合并交接`
-- **alembic head**：**`9c2d4e5f6a7b`**（含 `publish_plans.confirm_real_publish`；已落 DB；不要重复跑）
-- **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；改后端代码后**手动重启**：
+- **基线**：`main` @ `f8f8933 Merge track-10-canary-flags`（第二波最后一条）
+- **alembic head**：**`a1b2c3d4e5f6`**（含 `feature_flags` 表；已落 DB；不要重复跑）
+- **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；
+  **第二波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
   ```bash
+  kill 30876
   cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
     .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
   ```
   **不要带 `--reload`**（会启 Python 3.12 子进程，import error）
 - **前端进程**：pid `8947`，3000 端口；hot-reload 自动生效不用重启
-- **测试基线**：`cd fliki-clone-api && make test` 应得 **31 passed**；改完代码前后都跑一遍
+- **测试基线**：`cd fliki-clone-api && make test` 应得 **41 passed**；改完代码前后都跑一遍
 - **背景知识必读**：`SESSION_HANDOFF.md`（项目当前能力 / 已知坑 / 配置约束）
 
-## 0.1 第一波 7 Track 合并状态（2026-05-05 完成）
+## 0.1 第一波 7 Track 合并状态（2026-05-05 12:35 完成）
 
 | Track | 状态 | 合并 commit |
 |---|---|---|
@@ -30,6 +32,23 @@
 | 06 faster-whisper 本地 fallback | ✅ | `9079be9` |
 | 07 Pipeline DAG 视图 | ✅ | `e023449` |
 | 08 pytest 工程化 31/31 | ✅ | `9378faf` |
+
+## 0.2 第二波 4 Track 合并状态（2026-05-05 13:55 完成）
+
+合并顺序：T11 → T03 → T09 → T10（最后合 T10 解 `art.py` canary × 多角色叠加冲突）。
+
+| Track | 状态 | 合并 commit |
+|---|---|---|
+| 03 publish 任务异步化（celery + SSE） | ✅ | `af7d888` |
+| 09 多角色锁定 v5 | ✅ | `09eeb53` |
+| 10 灰度发布 / canary（alembic `a1b2c3d4e5f6`） | ✅ | `f8f8933` |
+| 11 Stripe 计费对接 | ✅ | `a355509` |
+
+合并冲突一处（已解决）：`fliki-clone-api/app/services/pipeline/agents/art.py`
+T09 v5 多角色 `anchors_url_by_role` 字典 与 T10 canary 闸门叠加。
+解法：保留 T09 字典构造；canary 命中 → 字典原样喂；不命中 → 字典清空 → 主角镜降到 prompt-only；
+outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_value`（T10）。
+新增 `tests/test_canary_multichar_combo.py` 4 case PASS（叠加点回归保护）。
 
 ## 1. 通用规则（所有 agent 必须遵守）
 
@@ -56,7 +75,9 @@
 12. **写完跑一遍 ReadLints / 看 import 路径**；**不要留 ad-hoc smoke 脚本**（用 pytest 或者跑完即删）。
 
 
-## 2. 第二波（第一波已 merge；以下 4 条可同时派发，互斥锁已划清）
+## 2. 第二波（已全部 merge，留作历史档案）
+
+> **以下 4 条均已合并到 main**（见 0.2 表）。新派发请直接看第 3 节长尾或 SESSION_HANDOFF.md 第 7 节推荐顺序。
 
 ### Track-03 · publish 任务异步化 ★★ (半天)
 
@@ -129,6 +150,18 @@
 ### Track-12 · bilibili 自动发布（依赖商务入驻）★ (2-3 天)
 - 等 MCN OpenAPI；技术骨架已在 `adapters/bilibili.py` 留好
 
+## 2.5 第三波候选（建议下次派发）
+
+| 优先级 | Track ID | 内容 | 工作量 |
+|---|---|---|---|
+| ★★ | T-13 | YouTube chunked PUT + 真账号 e2e（替换 resumable upload；avoid 1080p timeout；进度回写 `plan.meta_json.upload_progress`） | 半天 |
+| ★ | T-14 | 前端 Admin · Feature Flags 管理面板（settings 加 tab；列 tenant 全部 flag + 滑块改 pct + Apply；audit log 展示） | 1 天 |
+| ★ | T-15 | DLQ retry 识别 `task_name="publish.execute_plan"` 改派 `execute_publish_plan_task.delay` | 1-2 小时 |
+| ★ | T-16 | Stripe webhook 单元测试 + `charge.refunded` 退款事件处理 | 半天 |
+| ★ | T-17 | SSE 断网重连 `last_event_id`（pipeline + publish 两条流） | 半天 |
+| ★ | T-18 | model_calls 加 tenant_id + 按 tenant 聚合（L-11 升优） | 半天 |
+| ★ | T-19 | ArtAgent v6 多角色 IP-Adapter 真接入（等 Kolors-IP / Flux Redux multi-IP 端点） | 1-1.5 天 |
+
 ## 3. 长尾（任意时机）
 
 | ID | 任务 | 工作量 |
@@ -136,15 +169,16 @@
 | L-01 | 字幕翻译 + 多语言版本 | 1 天 |
 | L-02 | 卡拉 OK 高亮联动 audio.timeupdate | 半天 |
 | L-03 | metric dashboard（cost / view_count 时序） | 1.5 天 |
-| L-04 | 月账单 PDF 导出 + 邮件 | 1 天 |
-| L-05 | RBAC：workspace member editor/viewer 权限 | 1.5 天 |
+| L-04 | 月账单 PDF 导出 + 邮件（依赖 Track-11 webhook `invoice.paid`） | 1 天 |
+| L-05 | RBAC：workspace member editor/viewer 权限（替换 Track-10 admin 邮箱白名单） | 1.5 天 |
 | L-06 | Celery worker Docker + supervisor | 半天 |
 | L-07 | ADR-003 凭证加密策略 | 0.5 天 |
 | L-08 | ADR-004 多平台发布 SLA | 0.5 天 |
-| L-09 | ADR-005 角色一致性 v3→v4→LoRA 演进 | 0.5 天 |
+| L-09 | ADR-005 角色一致性 v3→v4→v5→LoRA 演进 | 0.5 天 |
 | L-10 | 配额超限 SSE 实时推送 | 半天 |
-| L-11 | model_calls 加 tenant_id + 按 tenant 聚合 | 半天 |
+| ~~L-11~~ → T-18 | ~~model_calls 加 tenant_id~~ → 移到第三波 | 半天 |
 | L-12 | 前端 i18n 完整覆盖 | 1.5 天 |
+| L-13 | Track-10 `ADMIN_EMAILS` 从 env 直读迁回 `Settings`（Track-01 互斥锁已解除） | 0.5 天 |
 
 ## 4. 给单个 Cursor Agent Window 的标准开工提示词
 
