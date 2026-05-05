@@ -22,6 +22,7 @@ import {
 import { Link, usePathname } from "@/i18n/navigation";
 import { getAdminMe } from "@/lib/admin-flags";
 import { cn } from "@/lib/utils";
+import { WorkspaceSelector } from "@/components/app-shell/workspace-selector";
 
 const primaryNav = [
   { href: "/app/files", label: "Files", icon: FolderOpen },
@@ -103,6 +104,10 @@ export function Sidebar() {
           <Zap className="h-6 w-6 text-white" />
         </span>
         <span className="text-xl font-extrabold text-[var(--text)]">Fliki</span>
+      </div>
+
+      <div className="border-b border-[var(--border)] px-5 py-3">
+        <WorkspaceSelector />
       </div>
 
       <nav className="flex flex-1 flex-col gap-8 overflow-y-auto px-5 py-6">
