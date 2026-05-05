@@ -55,6 +55,23 @@ class RenderRequest:
     - 业务侧用 `params` 传供应商无关的参数（prompt, duration, num_frames...）
     - `provider_hint` / `model_hint` 仅作偏好；实际 routing 由 gateway 决定
     - `idempotency_key` 用于流水线节点重跑时的去重
+
+    `params` 常见键（按 action 区分；保持 schema 弹性，不在 dataclass 上硬约束）：
+    - LLM:           `messages`, `temperature`, `max_tokens`, `approx_tokens`, `model`
+    - TTS:           `text`, `voice`, `speed`, `model`
+    - ASR:           `file_url` 或 `audio_bytes`, `language`, `timestamp_granularities`
+    - GENERATE_IMAGE:
+        * `prompt` (必填), `negative_prompt`, `aspect_ratio`, `image_size`,
+          `n`, `seed`, `guidance_scale`, `num_inference_steps`, `model`
+        * **`image_url`（v4 IP-Adapter）**：可选；传入参考图（通常是 ArtAgent
+          已落库的 `outputs.character_anchor.url`）作为 IP-Adapter / image-to-image
+          主参考帧。provider 不支持时（SiliconFlow 当前 Kolors / FLUX 多数模型）
+          会自动剥离重试同模型，并把 `output.ip_adapter_used=False` +
+          `output.ip_adapter_degrade_reason=<原因>` 写回；不影响 caller 拿图的
+          ok 状态。激活方式：env `SILICONFLOW_KOLORS_IP_MODEL=<model id>` 把
+          官方 IP 模型路由到主选。
+    - GENERATE_VIDEO/IMAGE_TO_VIDEO: `prompt`, `image_url`/`first_frame_url`,
+        `duration_s`, `num_frames`, `aspect_ratio`, `model`
     """
 
     action: ModelAction

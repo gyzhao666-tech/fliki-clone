@@ -1260,6 +1260,11 @@ function StepArtifacts({
                     ? (s.keyframe_error as string)
                     : null;
                 const characterLocked = s.character_locked === true;
+                const ipAdapterUsed = s.ip_adapter_used === true;
+                const ipDegradeReason =
+                  typeof s.ip_adapter_degrade_reason === "string"
+                    ? (s.ip_adapter_degrade_reason as string)
+                    : null;
                 return (
                   <div
                     key={i}
@@ -1279,11 +1284,28 @@ function StepArtifacts({
                       </div>
                     )}
                     {characterLocked ? (
-                      <span
-                        className="absolute right-1 top-1 rounded bg-emerald-500/20 px-1 text-[9px] font-mono text-emerald-200 backdrop-blur"
-                        title="v3 角色一致性 prompt 已注入（character_locked=true）"
-                      >
-                        🔒
+                      <span className="absolute right-1 top-1 flex items-center gap-0.5">
+                        <span
+                          className="rounded bg-emerald-500/20 px-1 text-[9px] font-mono text-emerald-200 backdrop-blur"
+                          title="v3 角色一致性 prompt 已注入（character_locked=true）"
+                        >
+                          🔒
+                        </span>
+                        {ipAdapterUsed ? (
+                          <span
+                            className="rounded bg-violet-500/30 px-1 text-[9px] font-mono text-violet-100 backdrop-blur"
+                            title="v4 IP-Adapter 真接入：本镜把 character_anchor 喂给 image provider（ip_adapter_used=true）"
+                          >
+                            IP
+                          </span>
+                        ) : ipDegradeReason ? (
+                          <span
+                            className="rounded bg-amber-500/30 px-1 text-[9px] font-mono text-amber-100 backdrop-blur"
+                            title={`v4 IP-Adapter 降级：${ipDegradeReason}`}
+                          >
+                            IP↓
+                          </span>
+                        ) : null}
                       </span>
                     ) : null}
                     <div className="text-center text-[10px] text-muted-foreground">
