@@ -37,6 +37,8 @@ class ProviderName(str, Enum):
     OPENAI = "openai"
     # 本地 faster-whisper（懒导入；用户无 OPENAI_API_KEY 时的 word-level fallback）
     FASTER_WHISPER_LOCAL = "faster_whisper_local"
+    # 百度智能云 ASR（短语音 REST，国内合规云端 ASR；不返 word/segment-level）
+    BAIDU = "baidu"
     DEMO = "demo"  # 无 key 时的本地占位，便于离线开发与测试
 
 

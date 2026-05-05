@@ -15,6 +15,7 @@ from typing import Optional
 
 from .cost import estimate_cost, record_call
 from .providers import (
+    BaiduASRProvider,
     BaseProvider,
     FasterWhisperLocalProvider,
     KlingProvider,
@@ -46,13 +47,15 @@ class Gateway:
             ModelAction.IMAGE_TO_VIDEO: [ProviderName.KLING],
             ModelAction.GENERATE_IMAGE: [ProviderName.SILICONFLOW],
             ModelAction.TTS: [ProviderName.ELEVENLABS, ProviderName.SILICONFLOW],
-            # ASR 三段降级：
-            #   1. OpenAI Whisper-1（云端 word-level，最稳）
-            #   2. faster-whisper 本地（缺 OPENAI_API_KEY 时的离线 word-level fallback）
-            #   3. SiliconFlow SenseVoice（无 word；voice agent 自动退到 v3 行级）
+            # ASR 四段降级：
+            #   1. OpenAI Whisper-1     云端 word-level，最稳；要 OPENAI_API_KEY
+            #   2. faster-whisper 本地  离线 word-level fallback；要装 faster-whisper 包
+            #   3. 百度智能云短语音      国内合规云端文本（不返 word，voice 退 v3 行级）
+            #   4. SiliconFlow SenseVoice 兜底（不返 word；voice 退 v3 行级）
             ModelAction.ASR: [
                 ProviderName.OPENAI,
                 ProviderName.FASTER_WHISPER_LOCAL,
+                ProviderName.BAIDU,
                 ProviderName.SILICONFLOW,
             ],
         }
@@ -237,6 +240,7 @@ def get_gateway() -> Gateway:
             gw.register(SiliconFlowASRProvider())
             gw.register(OpenAIWhisperProvider())
             gw.register(FasterWhisperLocalProvider())
+            gw.register(BaiduASRProvider())
             _gateway = gw
     return _gateway
 

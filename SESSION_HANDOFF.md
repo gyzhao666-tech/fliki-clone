@@ -1,7 +1,29 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：v1 工程闭环全部收口 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 + 第七波 5 = 27 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：v1 工程闭环全部收口 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 + 第七波 5 = 27 Track 全合 + 百度云 ASR provider）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 18:50 更新：**加 `BaiduASRProvider` 作为 OpenAI ASR 不可用时的国内云端兜底**（`make test 164/164 PASS`）。
+> 用户的 OpenAI key 用不了 → 加百度短语音 REST API 替代；凭证已落 `.env`（gitignore，不进 git），
+> 真访问百度 OAuth 端点拿 token 烟测通过（返 71 字符真 access_token）。
+>
+> 关键改动：
+> - 新 `app/services/model_gateway/providers/baidu_asr.py`：OAuth2 client_credentials 拿 access_token + 进程内缓存（30 天 TTL，提前 60s 刷新）+ POST `vop.baidu.com/server_api` JSON / base64 audio + err_no=3302 触发 token invalidate + retry 一次
+> - `types.py` 加 `ProviderName.BAIDU = "baidu"`；`cost.py` 加 `(BAIDU, ASR) = $0.0002/min`（按调用次数计费 estimate 偏低占位）；`config.py` 加 5 个 `baidu_asr_*` 字段；`.env.example` 加占位说明
+> - **gateway ASR 路由从 3 段升级到 4 段**：`[OPENAI, FASTER_WHISPER_LOCAL, BAIDU, SILICONFLOW]`
+>   - 有 OpenAI key → Whisper-1（云端 word-level 最稳）
+>   - 装了 faster-whisper → 本地（离线 word-level）
+>   - 配了百度 key → 百度短语音（云端 text-only，**卡拉 OK 字幕降到 v3 行级**）
+>   - 都没有 → SiliconFlow SenseVoice 兜底
+> - 18 case 单测覆盖 token 缓存 / err_no 错误码翻译 / 3302 鉴权重试 / dev_pid 默认 1537 / 语言映射英文 1737 / 显式覆盖 / 路由 + 注册集成
+>
+> **百度短语音限制**（用户上线前需知）：单次 ≤ 60s ≤ 10MB；只返完整 text 不返 word/segment-level 时间戳，
+> 所以 voice.py v4 卡拉 OK 字幕高亮在百度路径下自动降级到 v3 行级（与 SenseVoice 同 tier）。
+> 如要保留卡拉 OK，建议并存装 `faster-whisper`（`pip install faster-whisper`），路由会优先走本地。
+>
+> ⚠️ 本次集成时凭证通过 chat 上下文传递（不进 git），出于安全建议下次会话开始前到
+> [百度智能云控制台](https://console.bce.baidu.com/ai/#/ai/speech/app/list)
+> **重置应用的 API Key + Secret Key**，再把新值更新到 `.env`（重置后旧值立刻失效）。
 
 > 2026-05-05 17:35 更新：**多 Agent 第七波 5 Track 已合并到 main**（`pytest 146/146 PASS`）。
 > 合并顺序：T-29 → T-28 → T-26 → T-30 → T-27（T-27 与 T-26 在 `pipeline/page.tsx`

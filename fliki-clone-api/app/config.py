@@ -83,6 +83,22 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     # OpenAI ASR 模型；用户配了 openai_api_key 时 VoiceAgent 会优先走这个拿 word-level
     openai_asr_model: str = "whisper-1"
+
+    # ── 百度智能云 ASR（OpenAI 不可用时的国内合规 ASR 兜底）────────────────
+    # 配 BAIDU_ASR_API_KEY + BAIDU_ASR_SECRET_KEY 即可激活；gateway ASR 路由为
+    # `[OPENAI, FASTER_WHISPER_LOCAL, BAIDU, SILICONFLOW]`，三档前都不可用时
+    # 自动落到本 provider。app_id 当前短语音 REST 不强制要求；记录下方便排错。
+    # 限制：单次音频 ≤ 60s 且 ≤ 10MB；只返完整 text 不返 word/segment-level，
+    # voice.py v4 卡拉 OK 字幕高亮在本路径下自动降级到 v3 行级。
+    baidu_asr_api_key: str = ""
+    baidu_asr_secret_key: str = ""
+    baidu_asr_app_id: str = ""
+    # dev_pid 矩阵：1537 普通话近场（默认） / 1737 英语 / 1637 粤语 / 1837 四川话
+    # 80001 极速版（须改 endpoint 走 vop.baidu.com/pro_api，本 v1 未启用）
+    baidu_asr_dev_pid: int = 1537
+    # cuid 用于百度侧调用方追溯；缺省即可，多端共用没影响
+    baidu_asr_cuid: str = "fliki-clone-server"
+
     google_client_id: str = ""
     google_client_secret: str = ""
     github_client_id: str = ""

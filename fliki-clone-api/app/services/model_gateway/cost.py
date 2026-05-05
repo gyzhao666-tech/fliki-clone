@@ -43,6 +43,9 @@ _PRICE_TABLE: dict[tuple[ProviderName, ModelAction], float] = {
     (ProviderName.OPENAI, ModelAction.ASR): 0.006,
     # faster-whisper 本地推理零外部成本（占 CPU/RAM，调用方自行感知冷启动延迟）
     (ProviderName.FASTER_WHISPER_LOCAL, ModelAction.ASR): 0.0,
+    # 百度短语音公开报价：~¥0.0014/次（≈$0.0002）；按调用次数计费而非时长，
+    # 这里按 minutes 维度估到 0.0002/min 占位（estimate 偏低不影响真实账单）。
+    (ProviderName.BAIDU, ModelAction.ASR): 0.0002,
 }
 
 
