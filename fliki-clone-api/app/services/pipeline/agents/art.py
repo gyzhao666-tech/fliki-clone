@@ -1,4 +1,4 @@
-"""ArtAgent v3 — 风格 + 关键帧 + 角色一致性
+"""ArtAgent v3 / v4 — 风格 + 关键帧 + 角色一致性 + IP-Adapter 真接入
 
 输入：上游 ScriptAgent 的 outputs（topic / script / shots）+ Brief 中的可选视觉偏好
 输出：
@@ -9,6 +9,7 @@
 - `shots`：在 ScriptAgent shots 上叠加 `enhanced_prompt` / `negative_prompt` / `style_ref`
   / `keyframe_url`（v2：调 GENERATE_IMAGE 的产物，作为 IMAGE_TO_VIDEO 的参考帧）
   / `character_locked`（v3：该镜是否真把角色描述拼到 prompt 前缀）
+  / `ip_adapter_used`（v4：该镜出关键帧时是否真把锚点参考图喂给了 image provider）
 
 v3 角色一致性策略
 -----------------
@@ -32,9 +33,22 @@ v3 双层方案（**任何 image provider 都生效，不依赖 IP-Adapter**）�
    - `anchor`：强制要锚点；锚点失败则保留 prompt-only 并写 warning
    - `off`：v2 行为完全恢复
 
-4. **未来扩展**：当 image provider（Kolors-IP / Flux Redux）支持 `image_url`
-   作为 IP-Adapter 输入时，VideoAgent / 后续 art 调用可读 `character_anchor.url`
-   传入；当前 SiliconFlow `/images/generations` 接口未启用，留 hook。
+v4 IP-Adapter 真接入（在 v3 之上）
+---------------------------------
+v3 已生成 `outputs.character_anchor.url`，但只是放着没真喂回 image provider。v4
+让 `_generate_keyframes` 对 `character_locked=true` 的镜传 `image_url=anchor.url` 入
+`RenderRequest.params`：
+
+- 主角镜（character_locked=true）+ anchor.url 存在 → 传 image_url；
+  provider 真用了（Kolors-IP 或兼容路径）→ 该镜 outputs `ip_adapter_used=true`
+- 非主角镜（character_locked=false）→ 不传 image_url（避免污染聚焦的角色脸）→
+  `ip_adapter_used=false`
+- provider 不支持 image_url（返 400 / unknown parameter）→ siliconflow_image.py
+  自动剥离重试，本镜 `ip_adapter_used=false` + 写 `ip_adapter_degrade_reason`；
+  不影响 keyframe 生成（v3 prompt-only 兜底依然生效）
+
+激活方式：env `SILICONFLOW_KOLORS_IP_MODEL=<官方上线后的 model id>` 把 IP 模型
+路由到主选；缺省时仍尝试给现有 Kolors / FLUX 模型塞 image_url，由 provider 自决降级。
 
 设计取舍（v2 沿用）：
 - 默认为每镜出 1 张关键帧（约 $0.005/张，6 镜 ≈ $0.03，远小于视频生成成本）
@@ -230,12 +244,17 @@ class ArtAgent(Step):
             consistency_mode = "disabled"
 
         skip_keyframes = bool(brief.get("skip_keyframes"))
+        # v4：把锚点 URL 喂给 _generate_keyframes，主角镜的关键帧将真用 IP-Adapter
+        anchor_url_for_keyframes: str | None = None
+        if character_anchor and isinstance(character_anchor.get("url"), str):
+            anchor_url_for_keyframes = character_anchor["url"]
         if not skip_keyframes:
             enriched_shots, kf_cost, keyframe_failures = _generate_keyframes(
                 enriched_shots,
                 style_board=style_board,
                 ctx=ctx,
                 gateway=gateway,
+                character_anchor_url=anchor_url_for_keyframes,
             )
             total_cost += kf_cost
 
@@ -268,11 +287,21 @@ def _generate_keyframes(
     style_board: dict[str, Any],
     ctx: PipelineContext,
     gateway: Any,
+    character_anchor_url: str | None = None,
 ) -> tuple[list[dict[str, Any]], float, int]:
     """为每个 shot 调一次 GENERATE_IMAGE，写入 shots[i].keyframe_url。
 
-    单镜失败仅记 warning + 留 keyframe_error 字段；不影响其它镜与下游回退路径。
-    返回 (shots_with_keyframes, total_cost, failure_count)。
+    v4：当 `character_anchor_url` 提供且本镜 `character_locked=True` 时，把它作为
+    `image_url` 传入 RenderRequest.params，让 image provider 走 IP-Adapter 路径
+    锁定主角脸。每镜在 outputs 里加：
+
+    - `ip_adapter_used: bool`         provider 写回（True 表 image_url 真喂上去了）
+    - `ip_adapter_degrade_reason: str | None`  provider 剥离 image_url 时填这里
+
+    非主角镜（character_locked=False）不传 image_url，避免污染聚焦角色脸。
+
+    单镜失败（含 IP-Adapter 不支持后的 v3 兜底降级）仅记 warning + 留 keyframe_error
+    字段；不影响其它镜与下游回退路径。返回 (shots, total_cost, failure_count)。
     """
 
     aspect = str(style_board.get("aspect_ratio") or "16:9")
@@ -286,19 +315,30 @@ def _generate_keyframes(
         if not prompt:
             merged["keyframe_url"] = None
             merged["keyframe_error"] = "empty prompt"
+            merged["ip_adapter_used"] = False
             failures += 1
             out.append(merged)
             continue
 
+        # v4：只对「锁了主角」的镜传 anchor 作为 IP-Adapter 输入
+        is_protagonist_shot = bool(shot.get("character_locked"))
+        ref_image_url = (
+            character_anchor_url if (is_protagonist_shot and character_anchor_url) else None
+        )
+
+        params: dict[str, Any] = {
+            "prompt": prompt,
+            "negative_prompt": shot.get("negative_prompt"),
+            "aspect_ratio": shot.get("aspect_ratio") or aspect,
+            "n": 1,
+        }
+        if ref_image_url:
+            params["image_url"] = ref_image_url
+
         result = gateway.run(
             RenderRequest(
                 action=ModelAction.GENERATE_IMAGE,
-                params={
-                    "prompt": prompt,
-                    "negative_prompt": shot.get("negative_prompt"),
-                    "aspect_ratio": shot.get("aspect_ratio") or aspect,
-                    "n": 1,
-                },
+                params=params,
                 user_id=ctx.user_id,
                 file_id=ctx.file_id,
                 pipeline_step_id=ctx.step_id,
@@ -308,7 +348,10 @@ def _generate_keyframes(
 
         total_cost += float(result.cost_usd or 0.0)
 
-        if result.status == CallStatus.SUCCEEDED and isinstance(result.output, dict):
+        # 默认 False；只有 provider 在 output 里写回 True 时才认为 IP-Adapter 真生效
+        merged["ip_adapter_used"] = False
+
+        if result.ok and isinstance(result.output, dict):
             merged["keyframe_url"] = result.output.get("image_url")
             merged["keyframe_provider"] = (
                 result.provider.value if result.provider else None
@@ -316,9 +359,23 @@ def _generate_keyframes(
             merged["keyframe_model"] = result.model
             merged["keyframe_size"] = result.output.get("image_size")
             merged["keyframe_error"] = None
+            ip_used = bool(result.output.get("ip_adapter_used"))
+            merged["ip_adapter_used"] = ip_used
+            degrade = result.output.get("ip_adapter_degrade_reason")
+            if degrade:
+                merged["ip_adapter_degrade_reason"] = str(degrade)[:300]
+            elif ref_image_url and not ip_used:
+                # 我们传了 anchor 但 provider 没标 used 也没标 degrade（兜底）
+                merged["ip_adapter_degrade_reason"] = (
+                    "image_url passed but provider did not confirm IP-Adapter usage"
+                )
         else:
             merged["keyframe_url"] = None
             merged["keyframe_error"] = result.error or "image generation failed"
+            if ref_image_url:
+                merged["ip_adapter_degrade_reason"] = (
+                    f"keyframe call failed with image_url: {merged['keyframe_error']}"
+                )[:300]
             failures += 1
             logger.warning(
                 "art: keyframe failed for shot %s: %s",
