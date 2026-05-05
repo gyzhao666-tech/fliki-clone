@@ -1,6 +1,6 @@
 """Stripe webhook 事件 → DB（subscriptions / users）+ tenant_sync 派发。
 
-事件支持矩阵（Track-11 + Track-16 退款）
+事件支持矩阵（Track-11 + Track-16 退款 + Track-22 月账单邮件）
 ---------------------------------------
 | event                              | 操作                                                                |
 |------------------------------------|---------------------------------------------------------------------|
@@ -9,6 +9,7 @@
 | customer.subscription.deleted      | subscriptions.status='canceled' + users.plan='free' + sync_user_plan|
 | invoice.payment_failed             | subscriptions.status='past_due'（不动 plan，让 stripe 重试）        |
 | charge.refunded                    | subscriptions.refunded_at=NOW() 打标；**不动** tenant_quotas        |
+| invoice.paid                       | 渲 PDF（plan + 期内 model_calls 按 provider 拆分）→ SMTP 发 user.email |
 
 幂等：subscriptions.stripe_sub_id 唯一；同一事件重发只 UPDATE 不重复 INSERT。
 
@@ -25,7 +26,23 @@ charge.refunded 设计取舍（Track-16）
 
 不在这里做的：
 - 退款 → 月度配额自动回滚：见上；留给 L-04 ops 工具
-- 给用户发邮件通知：留 follow-up（接 fastapi-mail / Resend）
+- 给用户发邮件通知（除月账单 invoice.paid 外）：剩下的失败 / 退款通知留 follow-up
+
+invoice.paid 设计取舍（Track-22）
+--------------------------------
+- 主开关 `settings.invoice_email_enabled`：缺省 False，避免本地 dev 误发；
+  生产 .env 显式 `INVOICE_EMAIL_ENABLED=true` 才真发。开关关闭时返
+  `{handled:True, sent:False, reason:"invoice_email_enabled=false"}`，让 stripe
+  把这个事件标 delivered 而不是反复重投。
+- SMTP 缺配置（缺 SMTP_HOST / USER / PASSWORD 任一）→ `EmailNotConfigured`
+  捕获翻 `{handled:True, sent:False, reason:"smtp not configured"}`；同样不
+  让 stripe 重投。
+- PDF 渲失败（reportlab 异常）→ 也翻 `{handled:True, sent:False, reason:...}`。
+  stripe 不重投意味着这一封信永远发不出去，但比让 stripe 反复重投把 worker
+  打满更安全；ops 用 invoice_id + log 自行重发。
+- **不动** subscriptions / users / tenant_quotas：invoice.paid 的成功扣款已经
+  在 customer.subscription.updated 的续费链路里维护过，invoice.paid 只是「发
+  收据」一件事。
 """
 from __future__ import annotations
 
@@ -68,6 +85,8 @@ def handle_webhook_event(event: dict[str, Any]) -> dict[str, Any]:
         return _handle_invoice_payment_failed(obj, event_id=event_id)
     if event_type == "charge.refunded":
         return _handle_charge_refunded(obj, event_id=event_id)
+    if event_type == "invoice.paid":
+        return _handle_invoice_paid(obj, event_id=event_id)
 
     logger.info("billing webhook ignored type=%s id=%s", event_type, event_id)
     return {"handled": False, "type": event_type, "id": event_id}
@@ -290,6 +309,345 @@ def _handle_charge_refunded(charge: dict[str, Any], *, event_id: str) -> dict[st
     }
 
 
+# ── invoice.paid（Track-22 月账单 PDF + 邮件）───────────────────────────────
+
+
+def _handle_invoice_paid(invoice: dict[str, Any], *, event_id: str) -> dict[str, Any]:
+    """收到 stripe 续费成功的 invoice → 渲 PDF → SMTP 发用户邮箱。
+
+    任何「不能发」的原因（开关关 / 缺 SMTP / 缺 user.email / 缺 user_id /
+    PDF 渲失败 / SMTP 投递失败）都翻 `{handled:True, sent:False, reason:...}`，
+    避免 stripe 反复重投。真发成功时附 `email_to` / `pdf_size` 便于 audit log。
+    """
+    settings = get_settings()
+    if not bool(getattr(settings, "invoice_email_enabled", False)):
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice.get("id"),
+            reason="invoice_email_enabled=false",
+        )
+
+    invoice_id = invoice.get("id")
+    sub_id = invoice.get("subscription")
+    customer_id = invoice.get("customer")
+
+    user_id = (invoice.get("metadata") or {}).get("user_id")
+    if not user_id and sub_id:
+        user_id = _user_id_for_sub(sub_id)
+    if not user_id and customer_id:
+        user_id = _user_id_for_customer(customer_id)
+    if not user_id:
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason="user not resolved from invoice",
+        )
+
+    user_row = _fetch_user_for_invoice(user_id)
+    if not user_row:
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason=f"user row missing user_id={user_id}",
+        )
+    user_email = (user_row.get("email") or "").strip()
+    if not user_email:
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason=f"user.email empty user_id={user_id}",
+        )
+
+    plan = (user_row.get("plan") or "free") or "free"
+
+    period_start, period_end = _resolve_invoice_period(invoice)
+
+    try:
+        ctx = _build_invoice_context(
+            invoice=invoice,
+            user_id=user_id,
+            user_email=user_email,
+            plan=plan,
+            period_start=period_start,
+            period_end=period_end,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "billing invoice.paid build_context failed event=%s invoice=%s: %s",
+            event_id,
+            invoice_id,
+            exc,
+        )
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason=f"context build failed: {exc}",
+        )
+
+    try:
+        from app.services.billing.invoice_pdf import build_filename, render_invoice_pdf
+
+        pdf_bytes = render_invoice_pdf(ctx)
+        attachment_name = build_filename(ctx)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "billing invoice.paid pdf render failed event=%s invoice=%s: %s",
+            event_id,
+            invoice_id,
+            exc,
+        )
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason=f"pdf render failed: {exc}",
+        )
+
+    try:
+        from app.services.email import EmailMessage, EmailNotConfigured, send_email
+
+        msg = EmailMessage(
+            to=user_email,
+            subject=f"Fliki invoice {ctx.invoice_number or ctx.invoice_id}",
+            body=_invoice_email_body(ctx),
+            attachments=[(attachment_name, "application/pdf", pdf_bytes)],
+        )
+        result = send_email(msg)
+    except EmailNotConfigured as exc:
+        logger.warning(
+            "billing invoice.paid smtp not configured event=%s invoice=%s: %s",
+            event_id,
+            invoice_id,
+            exc,
+        )
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason="smtp not configured",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "billing invoice.paid smtp send failed event=%s invoice=%s: %s",
+            event_id,
+            invoice_id,
+            exc,
+        )
+        return _invoice_skip(
+            event_id=event_id,
+            invoice_id=invoice_id,
+            reason=f"smtp send failed: {exc}",
+        )
+
+    logger.info(
+        "billing invoice.paid sent event=%s invoice=%s user=%s to=%s pdf_size=%d",
+        event_id,
+        invoice_id,
+        user_id,
+        user_email,
+        len(pdf_bytes),
+    )
+    return {
+        "handled": True,
+        "sent": True,
+        "type": "invoice.paid",
+        "id": event_id,
+        "invoice_id": invoice_id,
+        "user_id": user_id,
+        "email_to": user_email,
+        "pdf_size": len(pdf_bytes),
+        "smtp": result,
+    }
+
+
+def _invoice_skip(
+    *,
+    event_id: str,
+    invoice_id: Optional[str],
+    reason: str,
+) -> dict[str, Any]:
+    """invoice.paid 不能发但又不让 stripe 重投的统一返回。"""
+    logger.info(
+        "billing invoice.paid skipped event=%s invoice=%s reason=%s",
+        event_id,
+        invoice_id,
+        reason,
+    )
+    return {
+        "handled": True,
+        "sent": False,
+        "type": "invoice.paid",
+        "id": event_id,
+        "invoice_id": invoice_id,
+        "reason": reason,
+    }
+
+
+def _resolve_invoice_period(invoice: dict[str, Any]) -> tuple[datetime, datetime]:
+    """invoice.period_{start,end} 是 unix epoch；缺失时退到 lines.data[0].period
+    再退到 (now-30d, now)。"""
+    start = _maybe_ts(invoice.get("period_start"))
+    end = _maybe_ts(invoice.get("period_end"))
+    if not start or not end:
+        lines = (invoice.get("lines") or {}).get("data") or []
+        if lines:
+            line_period = (lines[0] or {}).get("period") or {}
+            start = start or _maybe_ts(line_period.get("start"))
+            end = end or _maybe_ts(line_period.get("end"))
+    now = datetime.now(timezone.utc)
+    if not end:
+        end = now
+    if not start:
+        from datetime import timedelta
+
+        start = end - timedelta(days=30)
+    return start, end
+
+
+def _build_invoice_context(
+    *,
+    invoice: dict[str, Any],
+    user_id: str,
+    user_email: str,
+    plan: str,
+    period_start: datetime,
+    period_end: datetime,
+):
+    """invoice dict + user 上下文 → InvoiceContext（喂给 reportlab 的纯数据）。
+
+    注意：本函数会调用 PG（拉 model_calls 按 provider 聚合 + 解析 tenant_id），
+    所以放在 try 块里让 caller 把 DB 异常翻成 sent:False。
+    """
+    from app.services.billing.invoice_pdf import (
+        InvoiceContext,
+        ProviderCostLine,
+        StripeInvoiceLine,
+    )
+    from app.services.pipeline import tenant as pipeline_tenant
+
+    pipeline_tenant.clear_cache()
+    tctx = pipeline_tenant.resolve_tenant_context(user_id, user_plan=plan)
+    tenant_id = tctx.tenant_id
+
+    stripe_lines: list[StripeInvoiceLine] = []
+    raw_lines = (invoice.get("lines") or {}).get("data") or []
+    for raw in raw_lines:
+        if not isinstance(raw, dict):
+            continue
+        amount_cents = raw.get("amount") or raw.get("amount_paid") or 0
+        try:
+            amount_usd = float(amount_cents) / 100.0
+        except (TypeError, ValueError):
+            amount_usd = 0.0
+        stripe_lines.append(
+            StripeInvoiceLine(
+                description=str(raw.get("description") or "Subscription charge"),
+                amount_usd=amount_usd,
+                quantity=int(raw.get("quantity") or 1),
+            )
+        )
+
+    amount_paid_cents = invoice.get("amount_paid")
+    amount_paid_usd: Optional[float] = None
+    if amount_paid_cents is not None:
+        try:
+            amount_paid_usd = float(amount_paid_cents) / 100.0
+        except (TypeError, ValueError):
+            amount_paid_usd = None
+
+    provider_breakdown = _fetch_provider_breakdown_for_period(
+        tenant_id=tenant_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+    provider_lines = [
+        ProviderCostLine(
+            provider=row["provider"],
+            cost_usd=float(row["cost_usd"] or 0),
+            call_count=int(row["call_count"] or 0),
+        )
+        for row in provider_breakdown
+    ]
+
+    currency = (invoice.get("currency") or "usd")
+    return InvoiceContext(
+        tenant_id=tenant_id,
+        tenant_display_name=tctx.display_name,
+        plan=plan,
+        user_email=user_email,
+        period_start=period_start,
+        period_end=period_end,
+        invoice_id=str(invoice.get("id") or "?"),
+        invoice_number=invoice.get("number"),
+        currency=str(currency).upper(),
+        stripe_lines=stripe_lines,
+        provider_breakdown=provider_lines,
+        amount_paid_usd=amount_paid_usd,
+    )
+
+
+def _fetch_provider_breakdown_for_period(
+    *,
+    tenant_id: str,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[dict[str, Any]]:
+    """SQL 同 routers/cost.py::cost_summary，但聚焦 invoice 周期 + 简化输出。
+
+    用 T-18 落库的 ``model_calls.tenant_id`` 直接 GROUP BY provider；
+    DB 失败时返空集（不让 PDF 整体崩，让用户至少收到带订阅费的发票）。
+    """
+    sql = text(
+        """
+        SELECT
+            provider,
+            COALESCE(SUM(cost_usd), 0)::float AS cost_usd,
+            COUNT(*)::int AS call_count
+          FROM model_calls
+         WHERE tenant_id = :tenant_id
+           AND created_at >= :period_start
+           AND created_at <  :period_end
+         GROUP BY provider
+         ORDER BY cost_usd DESC
+        """
+    )
+    out: list[dict[str, Any]] = []
+    try:
+        engine = _engine()
+        with engine.connect() as conn:
+            for row in conn.execute(
+                sql,
+                {
+                    "tenant_id": tenant_id,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                },
+            ).mappings():
+                out.append(dict(row))
+    except Exception as exc:  # pragma: no cover - DB 故障不阻塞 PDF 生成
+        logger.warning(
+            "invoice.paid provider breakdown query failed tenant=%s: %s",
+            tenant_id,
+            exc,
+        )
+    return out
+
+
+def _invoice_email_body(ctx) -> str:
+    """纯文本邮件正文；HTML 留给 follow-up（先把 PDF 附件送达即可）。"""
+    return (
+        f"Hi,\n\n"
+        f"Your Fliki invoice for the period "
+        f"{ctx.period_start.date().isoformat()} → {ctx.period_end.date().isoformat()} "
+        f"is attached as PDF.\n\n"
+        f"Plan: {ctx.plan}\n"
+        f"Tenant: {ctx.tenant_display_name or ctx.tenant_id}\n"
+        f"Stripe Invoice ID: {ctx.invoice_id}\n\n"
+        f"Subscription charge: ${(ctx.amount_paid_usd or 0):.2f} {ctx.currency.upper()}\n\n"
+        f"You can also access invoices anytime via the Customer Portal in your "
+        f"billing settings.\n\n"
+        f"— Fliki\n"
+    )
+
+
 # ── DB helpers（sync engine，与 quota.py 一致）───────────────────────────────
 
 
@@ -461,6 +819,39 @@ def _user_id_for_sub(sub_id: str) -> Optional[str]:
             {"sid": sub_id},
         ).fetchone()
     return row[0] if row else None
+
+
+def _user_id_for_customer(customer_id: str) -> Optional[str]:
+    """invoice.paid metadata / subscription 都缺 user 时按 customer 反查最新订阅。
+
+    Track-22：单订阅用户场景足够；多订阅用户应在 Stripe metadata 上显式带 user_id
+    才能精确路由。
+    """
+    engine = _engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT user_id FROM subscriptions
+                 WHERE stripe_customer_id = :cid
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """
+            ),
+            {"cid": customer_id},
+        ).fetchone()
+    return row[0] if row else None
+
+
+def _fetch_user_for_invoice(user_id: str) -> Optional[dict[str, Any]]:
+    """拉 user 行的 email + plan；缺行返 None。Track-22 invoice.paid 用。"""
+    engine = _engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT email, plan FROM users WHERE id = :uid"),
+            {"uid": user_id},
+        ).mappings().fetchone()
+    return dict(row) if row else None
 
 
 def _plan_from_subscription_items(sub: dict[str, Any]) -> Optional[str]:

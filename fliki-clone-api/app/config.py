@@ -99,6 +99,24 @@ class Settings(BaseSettings):
     # （dev / 单机测试 / 没起 redis 都能继续工作）。
     celery_enabled: bool = False
 
+    # ── SMTP（Track-22 月账单 PDF + 邮件）──────────────────────────────────
+    # stdlib smtplib 薄封装；缺 SMTP_HOST/USER/PASSWORD 时 services/email
+    # 抛 EmailNotConfigured，webhook 翻 `{handled:True, sent:False}` 让 stripe 不重投。
+    # 与 mail_* (fastapi-mail 历史遗留) 同时存在但语义独立：
+    #   - mail_*：未来可能给前端通知 / 注册验证邮件用（fastapi-mail 异步）
+    #   - smtp_*：本 Track 月账单 PDF 附件发送（stdlib smtplib 同步，webhook 路径轻量）
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
+    # 缺省时 fallback 到 smtp_user，再缺省到 noreply@<smtp_host>
+    smtp_from: str = ""
+    # STARTTLS（587 默认 True）；SSL/TLS（465）走 smtp_use_ssl=True 直连
+    smtp_use_tls: bool = True
+    smtp_use_ssl: bool = False
+    # 主开关：缺省 False，避免本地 dev 误发；生产环境在 .env 显式置 true 才发
+    invoice_email_enabled: bool = False
+
     # Publishing 凭证 Fernet 对称加密 KEY（Track-01）。
     # url-safe base64 编码的 32-byte key（Fernet.generate_key() 输出格式）；
     # 留空时 credentials.py 会 fallback 到 plain text 写库（向后兼容老库）+ 启动 logger.warning。
