@@ -1,16 +1,16 @@
-# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 Track 全部已合并）
+# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 Track 全部已合并）
 
 > 这份是**给每个 Cursor Agent Window 看的**：进入仓库第一件事 read 这份，找你的 Track，按规则执行。
 > 协调者：人类（用户）；分支合并、SESSION_HANDOFF.md 更新由人类（或最后一个 agent）统一负责。
 
-## 0. 仓库 / 进程现状（2026-05-05 14:30 更新）
+## 0. 仓库 / 进程现状（2026-05-05 15:00 更新）
 
 - **GitHub**：https://github.com/gyzhao666-tech/fliki-clone（monorepo：`fliki-clone-api/` + `fliki-clone/`）
 - **本地仓库根**：`/Users/zhaoguangyuan/project/empty/`
-- **基线**：`main` @ `2b7ca16 Merge track-16-stripe-webhook-tests`（第三波最后一条）
-- **alembic head**：**`b2c3d4e5f6a7`**（含 `subscriptions.refunded_at`；已落 DB；不要重复跑）
+- **基线**：`main` @ `a3c7576 Merge track-18-model-calls-tenant`（第四波最后一条）
+- **alembic head**：**`c3d4e5f6a7b8`**（含 `model_calls.tenant_id` 列 + 索引 + backfill；已落 DB；不要重复跑）
 - **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；
-  **第二+三波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
+  **第二+三+四波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
   ```bash
   kill 30876
   cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
@@ -18,7 +18,7 @@
   ```
   **不要带 `--reload`**（会启 Python 3.12 子进程，import error）
 - **前端进程**：pid `8947`，3000 端口；hot-reload 自动生效不用重启
-- **测试基线**：`cd fliki-clone-api && make test` 应得 **79 passed**；改完代码前后都跑一遍
+- **测试基线**：`cd fliki-clone-api && make test` 应得 **89 passed**；改完代码前后都跑一遍
 - **背景知识必读**：`SESSION_HANDOFF.md`（项目当前能力 / 已知坑 / 配置约束）
 
 ## 0.1 第一波 7 Track 合并状态（2026-05-05 12:35 完成）
@@ -71,6 +71,15 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 协调者用 `git add -A && git commit` 收口，并代写 TRACK_14_NOTES.md（已删除）。
 下次派发提示词建议加一句「最后必须 `git status` 确认 working tree clean 才算交付」。
 
+## 0.4 第四波 1 Track 合并状态（2026-05-05 15:00 完成）
+
+| Track | 状态 | 合并 commit |
+|---|---|---|
+| 18 model_calls 加 tenant_id + 按 tenant 聚合 cost 视图（alembic `c3d4e5f6a7b8`）| ✅ | `a3c7576` |
+
+无合并冲突。alembic 双向迁移测过（upgrade → downgrade -1 → upgrade，列消失再回来不丢数据）。
+全量 pytest 89 PASS（79 baseline + 10 新增 4 unit + 6 integration）。
+
 ## 1. 通用规则（所有 agent 必须遵守）
 
 1. **每个 Track 一条 feature branch**（已预创建）；进入工作前：
@@ -78,11 +87,10 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
    git checkout track-XX-<your-track>
    ```
 2. **不要切换分支**；不要 rebase / merge main；改完留 commit 在 feature branch 上，由人类合并。
-3. **alembic 互斥锁**：第四波本批中**只有 Track-18** 占用迁移槽（rev `c3d4e5f6a7b8` 顶 `b2c3d4e5f6a7`）。
-   其它 Track**禁止**改 schema；需要新字段优先用 `meta_json` / `outputs_json` 等已有 JSON 列承载。
-4. **`.env` 互斥锁**：第四波本批**没人**需要改 `.env` / `app/config.py`。
-5. **`pipeline/page.tsx` 大文件分段**：T-18 独占 4 格 stat 下方 cost panel 段；其它历史 Track 已合到 main，新 agent 不动此文件除自己卡片注明的段。
-6. **commit 完整性 ★ 新规**：完成代码后**必须** `git status` 确认 working tree clean 才算交付（第三波 T-14 教训：agent 写完代码忘 commit 让协调者收口）。
+3. **alembic 互斥锁**：第五波（待派）暂未占用迁移槽；新 Track 加列时各自约定 rev id（顶 `c3d4e5f6a7b8`），多个 Track 同时加 schema 需要协调者串行合并。
+4. **`.env` 互斥锁**：先看 `app/config.py` 是否已有所需字段；新增 settings 字段单独留一个 Track 处理，不要在普通业务 Track 里夹带。
+5. **`pipeline/page.tsx` 大文件分段**：每个 Track 卡片必须明确指定动哪个子组件 / hook，不要越界。
+6. **commit 完整性 ★ T-14 教训**：完成代码后**必须** `git status` 确认 working tree clean 才算交付（第三波 T-14 写完代码忘 commit + NOTES，让协调者收口）。
 7. **commit message 风格**：参考 baseline；中英混合 OK；要写**为什么**（why）而非只列 what。
 8. **完成后写一份 `TRACK_<ID>_NOTES.md` 在仓库根**：包含：
    - 改了哪些文件 + 为什么
@@ -275,34 +283,27 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 
 ---
 
-## 2.6 第四波（T-16 alembic 已合并，T-18 可启动；T-19 仍等外部）
+## 2.6 第四波（已全部 merge，留作历史档案）
 
-### Track-18 · model_calls 加 tenant_id + 按 tenant 聚合 ★★ (半天)
-
-- **分支**：`track-18-model-calls-tenant`（已本地预创建在 main @ `b2c3d4e5f6a7` 之后）
-- **目标**：配额 v2 已经按 tenant 算 reserved/usage，但成本明细表 `model_calls` 还在按 user_id 聚合；改成 tenant 聚合 → 前端 cost 视图能看到「这个 tenant 本月真花了多少 / 各 provider 占比」。
-- **修改文件**：
-  - **新 alembic** `fliki-clone-api/alembic/versions/20260505_1600_add_model_calls_tenant_id.py`（rev `c3d4e5f6a7b8`，**顶 `b2c3d4e5f6a7`**）：加 `model_calls.tenant_id: VARCHAR NULL` + 普通索引 `ix_model_calls_tenant_id`；一次性 backfill：
-    ```sql
-    UPDATE model_calls SET tenant_id = COALESCE('u:' || user_id::text, 'anon:default') WHERE tenant_id IS NULL;
-    ```
-  - `fliki-clone-api/app/models/model_call.py`：加 `tenant_id: Optional[str]` 列
-  - `fliki-clone-api/app/services/model_gateway/gateway.py::record_call`：写 `tenant_id = request.tenant_id`（不存在时兜底 `f"u:{user_id}"`）
-  - **新路由** `fliki-clone-api/app/routers/cost.py`（或合到 `routers/pipelines.py`）：
-    - `GET /api/cost/summary?tenant_id=&period=monthly`：按 tenant 聚合 + 按 provider 拆分（`SELECT provider, SUM(cost_usd), COUNT(*) FROM model_calls WHERE tenant_id=:tid AND created_at >= :period_start GROUP BY provider`）
-    - `GET /api/cost/recent?tenant_id=&limit=50`：按 tenant 拉最近 50 条 model_calls
-  - 前端 4 格 stat 下方 cost panel 加「按 provider 拆分」横向 bar（emerald=OpenAI / sky=SiliconFlow / amber=Kling）+ 最近 N 条调用表格折叠
-- **互斥锁（独占）**：alembic 槽 `c3d4e5f6a7b8`、`models/model_call.py`、`gateway.py::record_call` 写记账段（小段独占）、新 `routers/cost.py`、前端 cost panel 段
-- **依赖**：✅ T-16 已合（alembic head `b2c3d4e5f6a7`）
-- **烟测**：
-  - 单元：`pytest -k cost` 断 record_call 写 tenant_id；reset 后查 sum 正确
-  - 集成：跑一次 video_full 端到端 → `SELECT tenant_id, sum(cost_usd) FROM model_calls GROUP BY tenant_id` → 应返该 tenant 的总额；前端 cost panel 显示按 provider 横向 bar
-- **不做**：cost 时序 dashboard（L-03 长尾）；用 grafana / 第三方
+> **以下 1 条已合并到 main**（见 0.4 表）。新派发请直接看 2.7 节第五波候选。
 
 ### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
 
 - **分支**：`track-19-multi-ip-adapter`（不创建本地分支，标 ⏸）
 - **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
+
+## 2.7 第五波候选（待派；可同时派发）
+
+> 当前 v1 核心闭环已就绪，剩余都是「优化 / 长尾」。建议派发节奏：3-5 个 Cursor Agent Window 同时跑，每个半天到 1.5 天。
+
+| 优先级 | Track ID | 内容 | 工作量 | 互斥锁 |
+|---|---|---|---|---|
+| ★★ | T-20 | YouTube + Stripe 真账号 e2e（用户配真 key 跑一次完整链路；写 e2e 报告 + 截图） | 半天 | 不动代码（仅文档 + .env 配置 + 跑) |
+| ★ | T-21 | L-03 metric dashboard 升级（用 T-18 的 model_calls.tenant_id 做按天 / provider 时序图；新前端 `/app/admin/metrics` 页面 + 后端 `/api/cost/timeseries` 端点） | 1.5 天 | 后端 `routers/cost.py` 加 `/timeseries` 段；前端独占新页面 |
+| ★ | T-22 | L-04 月账单 PDF + 邮件（拿 stripe `invoice.paid` 渲染 PDF + 调 fastapi-mail 发送） | 1 天 | 后端独占 `services/billing/invoice_pdf.py` + `services/email/` 新模块 |
+| ★ | T-23 | L-13 `ADMIN_EMAILS` 迁回 `Settings`（Track-10/14/18 都通过 `os.environ` 直读，本 Track 一次性收口） | 0.5 天 | 改 `app/config.py` 加字段；前端不动 |
+| ★ | T-24 | L-05 真 RBAC（workspace member editor/viewer/admin role；替换 Track-10/14 邮箱白名单） | 1.5 天 | 新 alembic 加 `team_members.role` 列 + 改 `_require_admin` 逻辑 |
+| ★ | T-25 | L-10 配额超限 SSE 实时推送（用 T-17 redis Stream 框架推 `quota_exceeded` 事件给前端 toast） | 半天 | 改 `services/pipeline/quota.py::reserve` 抛事件；前端 hook 订阅 |
 
 ## 3. 长尾（任意时机）
 
