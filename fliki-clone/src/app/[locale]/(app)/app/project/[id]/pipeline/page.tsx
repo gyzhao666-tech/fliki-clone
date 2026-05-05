@@ -48,6 +48,7 @@ import { usePipelineStream } from "@/hooks/use-pipeline-stream";
 import { useRunRenders } from "@/hooks/use-run-renders";
 import { useRunShotList } from "@/hooks/use-run-shot-list";
 import { useDlq } from "@/hooks/use-dlq";
+import { usePublishPlanStream } from "@/hooks/use-publish-plan-stream";
 import {
   DLQ_STATUSES,
   DlqItemOut,
@@ -2211,6 +2212,33 @@ function PlanRow({
     setConfirmReal(plan.confirm_real_publish);
   }, [plan.confirm_real_publish]);
 
+  // Track-03：execute 异步化后，PlanRow 用 SSE 等 worker 跑完
+  // - executing=true 时禁掉 Upload + Send + 状态切换 + 删除按钮，避免重复派发
+  // - 终态 phase=completed/system_error 由 hook onTerminal 弹 toast + onChanged 拉新数据
+  const planStream = usePublishPlanStream({
+    onTerminal: (event) => {
+      onChanged();
+      if (event?.phase === "completed") {
+        if (event.ok) {
+          feedback.success(
+            `${plan.platform} ✓ external_id ${event.external_id ?? "—"}`
+          );
+        } else {
+          feedback.error(event.error ?? `${plan.platform} 执行失败`);
+        }
+      } else if (event?.phase === "system_error") {
+        feedback.error(
+          `${plan.platform} 系统级失败（已入 DLQ，可在死信队列面板重投）：${
+            event.error ?? "未知错误"
+          }`
+        );
+      }
+    },
+  });
+  const executing = planStream.pending;
+  const streamMode = planStream.mode;
+  const latestPhase = planStream.latestEvent?.phase ?? null;
+
   const handleStatus = useCallback(
     async (status: PublishPlanOut["status"]) => {
       setBusy(true);
@@ -2263,25 +2291,20 @@ function PlanRow({
       : `执行发布计划（${plan.platform}）？\n` +
         `当前为 mock 路径（dry-run / bilibili 不会真发；youtube 安全闸门关闭，回 mock external_id）。`;
     if (!window.confirm(promptText)) return;
-    setBusy(true);
+    // Track-03：先开 SSE 订阅再发 POST，避免 worker 跑很快时事件比订阅早到丢失
+    planStream.start(plan.id, plan.file_id);
     try {
-      const out = await executePublishPlan(plan.id);
-      if (out.ok) {
-        feedback.success(
-          `${plan.platform} ✓ external_id ${out.external_id ?? "—"}`
-        );
-      } else {
-        feedback.error(out.error ?? `${plan.platform} 执行失败`);
-      }
-      onChanged();
+      const accepted = await executePublishPlan(plan.id);
+      feedback.info(
+        `${plan.platform} 已派发（${accepted.dispatcher}）；正在等执行结果…`
+      );
     } catch (err) {
+      planStream.stop();
       const message =
         err instanceof ApiError ? `API ${err.status}` : "网络错误";
-      feedback.error(`执行失败：${message}`);
-    } finally {
-      setBusy(false);
+      feedback.error(`派发失败：${message}`);
     }
-  }, [confirmReal, onChanged, plan.id, plan.platform]);
+  }, [confirmReal, plan.file_id, plan.id, plan.platform, planStream]);
   const handleDelete = useCallback(async () => {
     if (!window.confirm(`删除发布计划（${plan.platform}）？`)) return;
     setBusy(true);
@@ -2312,6 +2335,29 @@ function PlanRow({
       : "安全 mock：仅返回假 external_id（开启「真发」后才真打）"
     : "调用发布执行器：把 render 真推到目标平台（dry-run / bilibili / youtube）";
 
+  // Track-03：execute 进 worker 后，整行所有按钮都禁掉避免重复派发
+  const rowBusy = busy || executing;
+  // executing 时的状态徽标：phase=running → 「执行中（celery/polling）」
+  // 没收到 phase 但 mode=stream → 「派发中…」
+  const execBadge = executing ? (
+    <span
+      className={
+        "shrink-0 rounded border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide " +
+        (latestPhase === "running"
+          ? "border-sky-500/40 bg-sky-500/15 text-sky-500"
+          : "border-amber-500/40 bg-amber-500/15 text-amber-500")
+      }
+      title={
+        streamMode === "polling"
+          ? "SSE 不可用，已 fallback 2.5s polling"
+          : "已派发到 worker，等 publish_plan_state 推 phase=completed"
+      }
+    >
+      {latestPhase === "running" ? "执行中" : "派发中"}
+      {streamMode === "polling" ? " · poll" : ""}
+    </span>
+  ) : null;
+
   return (
     <li className="flex flex-col gap-1 rounded border border-border bg-background/40 px-2 py-1.5">
       <div className="flex items-center gap-2">
@@ -2337,6 +2383,7 @@ function PlanRow({
                 LIVE
               </span>
             ) : null}
+            {execBadge}
           </div>
           <div className="truncate text-[10px] text-muted-foreground">
             {plan.render_id ? `render ${plan.render_id.slice(0, 8)}…` : "无 render"}
@@ -2355,7 +2402,7 @@ function PlanRow({
           onChange={(e) =>
             handleStatus(e.target.value as PublishPlanOut["status"])
           }
-          disabled={busy}
+          disabled={rowBusy}
         >
           {PUBLISH_PLAN_STATUSES.map((s) => (
             <option key={s} value={s}>
@@ -2381,7 +2428,7 @@ function PlanRow({
             className="size-3 accent-rose-500"
             checked={confirmReal}
             onChange={(e) => handleConfirmRealToggle(e.target.checked)}
-            disabled={busy}
+            disabled={rowBusy}
           />
           真发
         </label>
@@ -2391,10 +2438,18 @@ function PlanRow({
             variant="ghost"
             className={uploadBtnCls}
             onClick={handleExecute}
-            disabled={busy}
-            title={uploadBtnTitle}
+            disabled={rowBusy}
+            title={
+              executing
+                ? "执行中（worker 跑 publish.execute_plan）；等 SSE 推 phase=completed"
+                : uploadBtnTitle
+            }
           >
-            <Upload className="size-3.5" />
+            {executing ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Upload className="size-3.5" />
+            )}
           </Button>
         ) : null}
         {plan.status === "scheduled" || plan.status === "draft" ? (
@@ -2402,7 +2457,7 @@ function PlanRow({
             size="sm"
             variant="ghost"
             onClick={() => handleStatus("published")}
-            disabled={busy}
+            disabled={rowBusy}
             title="仅状态记账（不调发布执行器；适合手动发完后回填）"
           >
             <Send className="size-3.5" />
@@ -2412,7 +2467,7 @@ function PlanRow({
           size="sm"
           variant="ghost"
           onClick={handleDelete}
-          disabled={busy}
+          disabled={rowBusy}
           title="删除发布计划"
         >
           <Trash2 className="size-3.5" />

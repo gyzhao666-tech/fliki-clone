@@ -10,18 +10,21 @@
 """
 from __future__ import annotations
 
+import asyncio
+import json as _json_mod
 import uuid
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, AsyncIterator, Optional
 
-from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
 from app.config import get_settings
 from app.deps import CurrentUser
 from app.models.production import PUBLISH_STATUSES, REVIEW_SEVERITIES
+from app.services.pipeline import events as pipeline_events
 from app.services.publishing import (
     PublishError,
     execute_publish_plan as _execute_publish_plan,
@@ -725,51 +728,234 @@ class OAuthStartOut(BaseModel):
     state: str
 
 
-@router.post(
-    "/publish-plans/{plan_id}/execute",
-    response_model=PublishOutcomeOut,
-)
-async def execute_publish_plan_route(
-    plan_id: str, current_user: CurrentUser
-) -> PublishOutcomeOut:
-    """触发发布执行；同步等 adapter 返回。
+# ── Track-03：publish 任务异步化 ─────────────────────────────────────────────
+# 默认行为：把执行入队（celery default 队列；未启用 celery 时退到 BackgroundTasks）
+# + 立即返 202 + Location 指向 SSE 端点；前端用 EventSource 拉
+# `publish_plan_state` 事件流，从 phase=running → phase=completed/system_error
+# 实时刷新 PlanRow，避免 30-60s 卡 HTTP 超时。
+#
+# 兼容：保留 `?sync=true` query 参数走旧 v1 路径，方便服务端任务（schedule
+# worker 之类）或回归测试不想依赖 SSE 的场景；同步路径行为/响应体与 Track-03 之前完全一致。
 
-    返：执行结果 + 最新 plan 视图（status / external_id / error 已写入）。
-    系统级异常（PublishError）翻成 502，让调用方决定是否重试 / 入 DLQ。
+
+class PublishExecuteAcceptedOut(BaseModel):
+    plan_id: str
+    accepted: bool = True
+    dispatcher: str  # "celery" | "background"
+    events_url: str
+    plan: Optional[PublishPlanOut] = None
+
+
+def _dispatch_publish_execute(
+    plan_id: str, user_id: str, background_tasks: BackgroundTasks
+) -> str:
+    """把 publish 执行派发到 worker / BackgroundTasks。返回 dispatcher 名。"""
+
+    settings = get_settings()
+    if settings.celery_enabled:
+        # 局部 import：未启 celery 时不加载 worker 依赖路径
+        from app.services.pipeline.tasks import execute_publish_plan_task
+
+        execute_publish_plan_task.apply_async(
+            args=[plan_id, user_id], queue="default"
+        )
+        return "celery"
+
+    # BackgroundTasks 兜底：dev 不起 redis/worker 也能跑；与 task 共用同一份业务体
+    # 让 SSE 事件流语义两条路径完全一致
+    from app.services.pipeline.tasks import _publish_execute_with_events
+
+    background_tasks.add_task(_publish_execute_with_events, plan_id, user_id)
+    return "background"
+
+
+@router.post("/publish-plans/{plan_id}/execute")
+async def execute_publish_plan_route(
+    plan_id: str,
+    current_user: CurrentUser,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    sync: bool = False,
+):
+    """触发发布执行；默认入队 + 即返 202，SSE 推 publish_plan_state。
+
+    - 默认（异步）：dispatch 到 celery/BackgroundTasks → 返 202 +
+      `{plan_id, accepted, dispatcher, events_url, plan}`；前端订阅
+      `events_url`（即 `/publish-plans/{id}/events`）拉 SSE 直到 phase=completed
+    - `?sync=true`：保留旧路径，同步等 adapter；返 200 + PublishOutcomeOut；
+      用于服务端脚本 / 回归测试 / 没起 redis 时绕过 SSE
+    - 系统级异常（PublishError）走异步路径时由 task 入 DLQ + SSE phase=system_error；
+      走同步路径时仍 502 + DLQ
     """
     _ensure_publish_plan_owner(plan_id, current_user.id)
 
-    try:
-        outcome = _execute_publish_plan(plan_id, user_id=current_user.id)
-    except PublishError as exc:
-        # 系统级异常：进 DLQ + 返 502
+    if sync:
         try:
-            from app.services.pipeline import dlq as pipeline_dlq
+            outcome = _execute_publish_plan(plan_id, user_id=current_user.id)
+        except PublishError as exc:
+            try:
+                from app.services.pipeline import dlq as pipeline_dlq
 
-            pipeline_dlq.push(
-                task_name="publish.execute_plan",
-                args=[plan_id],
-                kwargs={"user_id": current_user.id},
-                user_id=current_user.id,
-                error=str(exc),
-                run_id=None,
+                pipeline_dlq.push(
+                    task_name="publish.execute_plan",
+                    args=[plan_id],
+                    kwargs={"user_id": current_user.id, "sync": True},
+                    user_id=current_user.id,
+                    error=str(exc),
+                    run_id=None,
+                )
+            except Exception:  # pragma: no cover - DLQ 写失败也不破坏 502
+                pass
+            raise HTTPException(
+                status_code=502,
+                detail=f"publish system error (queued in DLQ): {exc}",
             )
-        except Exception:  # pragma: no cover - DLQ 写失败也不破坏 502
-            pass
-        raise HTTPException(
-            status_code=502,
-            detail=f"publish system error (queued in DLQ): {exc}",
+
+        plan = _load_plan_or_404(plan_id)
+        return PublishOutcomeOut(
+            plan_id=plan_id,
+            ok=outcome.ok,
+            status=outcome.status,
+            external_id=outcome.external_id,
+            external_url=outcome.external_url,
+            error=outcome.error,
+            plan=plan,
         )
 
+    # 异步路径
+    dispatcher = _dispatch_publish_execute(
+        plan_id, current_user.id, background_tasks
+    )
     plan = _load_plan_or_404(plan_id)
-    return PublishOutcomeOut(
-        plan_id=plan_id,
-        ok=outcome.ok,
-        status=outcome.status,
-        external_id=outcome.external_id,
-        external_url=outcome.external_url,
-        error=outcome.error,
-        plan=plan,
+    events_path = f"{request.url.path.rsplit('/execute', 1)[0]}/events"
+    return _accepted_response(
+        PublishExecuteAcceptedOut(
+            plan_id=plan_id,
+            accepted=True,
+            dispatcher=dispatcher,
+            events_url=events_path,
+            plan=plan,
+        )
+    )
+
+
+def _accepted_response(payload: PublishExecuteAcceptedOut):
+    """202 + JSON body；用 fastapi.Response 包装让 status_code 立刻反馈给前端。"""
+
+    from fastapi import Response
+
+    body = _json_mod.dumps(
+        payload.model_dump(), ensure_ascii=False, default=str
+    )
+    return Response(
+        content=body,
+        status_code=status.HTTP_202_ACCEPTED,
+        media_type="application/json",
+        headers={"Location": payload.events_url},
+    )
+
+
+# ── SSE：publish_plan_state 推流 ────────────────────────────────────────────
+# 协议：
+#   event: snapshot              data: <PublishPlanOut JSON>          连接首条；前端用它对齐全量
+#   event: publish_plan_state    data: <{plan_id, phase, ok, status,
+#                                       external_id, external_url, error}>
+#                                                                     phase ∈ {running, completed, system_error}
+#   :ping                                                              注释行 heartbeat（25s）
+# 终止条件：
+#   - 客户端断开（request.is_disconnected）
+#   - 收到 phase ∈ {completed, system_error} 的事件后再 200ms 关闭
+#   - plan 已是终态（status=published / failed / cancelled）时，snapshot 后立刻关闭
+#   - 5 分钟兜底（YouTube upload p99 < 2 min；远超就有别的问题，断流让前端 fallback polling）
+
+_PUBLISH_SSE_HEARTBEAT_SEC = 25.0
+_PUBLISH_SSE_MAX_DURATION_SEC = 5 * 60.0
+_PUBLISH_TERMINAL_STATUSES = {"published", "failed", "cancelled"}
+_PUBLISH_TERMINAL_PHASES = {"completed", "system_error"}
+
+
+def _sse_format(event: str, data: dict[str, Any]) -> str:
+    return (
+        f"event: {event}\n"
+        f"data: {_json_mod.dumps(data, ensure_ascii=False, default=str)}\n\n"
+    )
+
+
+async def _publish_plan_sse_stream(
+    plan_id: str, request: Request
+) -> AsyncIterator[str]:
+    """打开一个 SSE 流：snapshot → 订阅 redis 事件 → 终态后关闭。"""
+
+    try:
+        plan = _load_plan_or_404(plan_id)
+    except HTTPException as exc:
+        yield _sse_format("error", {"detail": exc.detail})
+        return
+    yield _sse_format("snapshot", plan.model_dump())
+
+    if plan.status in _PUBLISH_TERMINAL_STATUSES:
+        return
+
+    stop_event = asyncio.Event()
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + _PUBLISH_SSE_MAX_DURATION_SEC
+    last_hb = loop.time()
+    sub_iter = pipeline_events.subscribe_publish_plan(
+        plan_id, stop_event=stop_event
+    )
+
+    try:
+        async for tick_msg in sub_iter:
+            now = loop.time()
+            if now > deadline:
+                return
+            if await request.is_disconnected():
+                return
+
+            if tick_msg is None:
+                if now - last_hb >= _PUBLISH_SSE_HEARTBEAT_SEC:
+                    yield ": ping\n\n"
+                    last_hb = now
+                continue
+
+            event_type, payload = tick_msg
+            yield _sse_format(event_type, payload)
+            last_hb = now
+
+            # phase=completed/system_error 后给其他事件留 200ms 缓冲再断开
+            if event_type == "publish_plan_state":
+                phase = payload.get("phase")
+                if (
+                    isinstance(phase, str)
+                    and phase in _PUBLISH_TERMINAL_PHASES
+                ):
+                    await asyncio.sleep(0.2)
+                    return
+    finally:
+        stop_event.set()
+        try:
+            await sub_iter.aclose()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+@router.get("/publish-plans/{plan_id}/events")
+async def publish_plan_events_stream(
+    plan_id: str,
+    current_user: CurrentUser,
+    request: Request,
+):
+    """SSE 流：实时推 publish_plan_state；snapshot 起手 + heartbeat + 自动关闭。"""
+
+    _ensure_publish_plan_owner(plan_id, current_user.id)
+    return StreamingResponse(
+        _publish_plan_sse_stream(plan_id, request),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",  # 关掉 nginx / proxy 缓冲
+            "Connection": "keep-alive",
+        },
     )
 
 

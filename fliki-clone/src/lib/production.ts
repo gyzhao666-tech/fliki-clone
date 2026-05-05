@@ -226,6 +226,18 @@ export interface PublishOutcomeOut {
   plan: PublishPlanOut | null;
 }
 
+/**
+ * Track-03：异步派发响应（POST /publish-plans/{id}/execute 默认返）。
+ * `dispatcher` ∈ "celery" | "background"；前端拿 `events_url` 开 SSE。
+ */
+export interface PublishExecuteAcceptedOut {
+  plan_id: string;
+  accepted: boolean;
+  dispatcher: "celery" | "background";
+  events_url: string;
+  plan: PublishPlanOut | null;
+}
+
 export interface PlatformOut {
   name: string;
   is_real: boolean;
@@ -250,9 +262,24 @@ export interface OAuthStartOut {
   state: string;
 }
 
+/**
+ * Track-03：默认异步派发，立即返 202 + Accepted 体（含 SSE events_url）。
+ * 前端拿 events_url 用 EventSource 订阅 publish_plan_state 流。
+ */
 export function executePublishPlan(planId: string) {
-  return api<PublishOutcomeOut>(
+  return api<PublishExecuteAcceptedOut>(
     `/production/publish-plans/${planId}/execute`,
+    { method: "POST" }
+  );
+}
+
+/**
+ * Track-03：保留 v1 同步路径，给服务端脚本 / 回归测试 / 没起 redis 的本地用。
+ * 调用方拿到的是真正等 adapter 返回后的 PublishOutcome（30-60s 阻塞）。
+ */
+export function executePublishPlanSync(planId: string) {
+  return api<PublishOutcomeOut>(
+    `/production/publish-plans/${planId}/execute?sync=true`,
     { method: "POST" }
   );
 }
