@@ -9,6 +9,7 @@ from fastapi.staticfiles import StaticFiles
 from app.config import get_settings
 from app.routers import (
     admin_flags_router,
+    cost_router,
     ai_router,
     assets_router,
     auth_router,
@@ -142,3 +143,6 @@ app.include_router(dlq_router, prefix=PREFIX)
 
 # Admin · 灰度发布 / canary feature flags（Track-10）
 app.include_router(admin_flags_router, prefix=PREFIX)
+
+# Cost · 按 tenant 聚合的明细成本视图（Track-18）
+app.include_router(cost_router, prefix=PREFIX)
