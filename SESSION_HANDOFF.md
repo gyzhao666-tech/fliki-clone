@@ -1,7 +1,20 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：核心 v1 全闭环 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 15:50 更新：**多 Agent 第五波 4 Track 已合并到 main**（`pytest 120/120 PASS`）。
+> 合并顺序：T-25 → T-22 → T-21 → T-23（T-23 留最后吸收 `.env.example` 顶部 SMTP_* + ADMIN_EMAILS 区域冲突；
+> `app/config.py` 由 git auto-merge 自动并入两组字段）。alembic head 仍是 **`c3d4e5f6a7b8`**（本批没人占）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 21 metric dashboard（cost 时序图 + admin metrics 页）| `routers/cost.py` 末尾追加 `GET /api/cost/timeseries?tenant_id=&provider=&period=daily\|weekly&days=30`：SQL `DATE_TRUNC('day'/'week', created_at)` GROUP BY day, provider 聚合，返 `[{date, provider, cost_usd, call_count}]`；复用既有 `_resolve_query_tenant` 鉴权；不动既有 `/summary` `/recent`；新前端 `app/[locale]/(app)/app/admin/metrics/page.tsx`（939 行）：tenant 选择器 + provider 多选 chips + period toggle + recharts LineChart 多 series（每 provider 一条折线）+ 顶部数字 total_cost / total_calls；`lib/cost.ts` 加 `getCostTimeseries` + `CostTimeseriesPoint`；`sidebar.tsx` admin 命中渲「Admin · Metrics」入口与 Feature Flags 并列；8 case 单测 |
+> | 22 月账单 PDF + SMTP 邮件（invoice.paid）| `requirements.txt` 加 `reportlab>=4.0`；`config.py` 加 5 条 `SMTP_*` 字段 + `invoice_email_enabled: bool = False`（缺省关闭防误发）；`.env.example` 加 SMTP 配置说明；新 `services/billing/invoice_pdf.py`（382 行）reportlab 渲 A4 PDF 含 plan + period + 按 provider cost 表 + 总金额（数据源 stripe invoice + T-18 model_calls 期内明细）；新 `services/email/{__init__,smtp_client}.py` 薄封装 stdlib smtplib（缺 SMTP 抛 EmailNotConfigured，不引第三方依赖）；`webhook_handlers.py` 加 `invoice.paid` dispatch + `_handle_invoice_paid`：`invoice_email_enabled=False` 返 `{handled:True, sent:False, reason:...}` 让 stripe 不重投；与 T-16 既有 5 handler 共存；7 case 单测 |
+> | 23 ADMIN_EMAILS 迁回 Settings | `config.py` 加 `admin_emails: str = "demo@example.com"` 字段（pydantic-settings 自动从 env 读，逗号分隔）；`routers/admin_flags.py::_allowed_admins()` 改读 `get_settings().admin_emails`，按逗号 split + strip + lower + 去空 + set 化；保留 `demo@example.com` 兜底（dev fixtures 兼容）；T-10/14/18 既有调用方走 `_is_admin_email` 不变；`tests/test_admin_flags.py` 既有 7 case 用 monkeypatch settings 替代 `os.environ.set` 注入；6 case 新单测 |
+> | 25 配额超限 / Provider 桶满 SSE 实时推送 | `services/pipeline/events.py` 复用 `_publish_to_channel`/`_subscribe_channel` 内核，新加 `publish_user_event(user_id, event_type, payload)` + `subscribe_user(user_id, *, last_event_id, stop_event)` async iterator；channel `user:{user_id}` 与 `pipeline:run` / `publish:plan` 互不打扰；redis Stream + pub/sub 双写继承 T-17 断网续传能力；`quota.reserve_tenant` 抛 402 之前调 `publish_user_event(user_id, "quota_exceeded", {...})`；`provider_buckets.acquire` BucketFull 时调 `publish_user_event(..., "bucket_full", {...})`；`gateway.py` 把 user_id 透传给 bucket acquire；新路由 `GET /api/pipelines/user-events` SSE（owner 鉴权 CurrentUser.id == channel user_id，snapshot+增量）；前端新 hook `use-user-events.ts` + `<UserEventsListener/>` client component 挂在 `(app)/layout.tsx` 全局生效，监听 `quota_exceeded` → `feedback.error` toast / `bucket_full` → `feedback.warning` toast；10 case 单测 |
+>
+> **整体能力扩展**：v1 上线后的可观测性（按天/provider 时序图 cost dashboard）+ 计费收口（月账单 PDF 邮件自动发）+ 平台清洁度（admin 配置 .env settings 化）+ 用户体验（配额超限/满桶提前 toast 不再突然 402/429）。
 
 > 2026-05-05 15:00 更新：**Track-18 已合并到 main**（`pytest 89/89 PASS`）。
 > alembic head 升到 **`c3d4e5f6a7b8`**（顶 `b2c3d4e5f6a7`，`model_calls.tenant_id` 列 + 索引 + 一次性 backfill 老行为 `u:{user_id}`）。
@@ -123,17 +136,18 @@
 ## 2026-05-05 当前进程（最新）
 
 - **后端 pid 30876**（仍在 11:13 启的旧进程；监听 `127.0.0.1:8000`，无 proxy 污染；
-  代码改了未重启 → **下次重启会加载第二+三+四波 10 条 Track 新代码 + alembic head `c3d4e5f6a7b8`**）
+  代码改了未重启 → **下次重启会加载第二+三+四+五波 14 条 Track 新代码 + alembic head `c3d4e5f6a7b8`**）
 - **前端 pid 8947**（next dev，3000 端口，hot-reload 自动生效；
-  第四波前端改动（cost panel 横向 bar）已 hot-reload）
+  第五波前端改动（admin metrics 页 + cost panel + UserEventsListener 全局 toast）已 hot-reload）
 
-**第四波合并后必做**：
+**第五波合并后必做**：
 
 ```bash
 # 1. 停旧 backend（pid 30876）
 kill 30876
 
-# 2. 跑 alembic（落 4 条新迁移：feature_flags + subscriptions.refunded_at + model_calls.tenant_id + backfill）
+# 2. 跑 alembic（落第二+三+四波 4 条迁移：feature_flags + subscriptions.refunded_at +
+#               model_calls.tenant_id + backfill；第五波没动 schema）
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
   .venv/bin/python -m alembic upgrade head   # → c3d4e5f6a7b8
 
@@ -141,9 +155,13 @@ cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
   .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 4. 验证（应看到 ~123 routes / 6 billing / 6 admin-flag 含 /me 和 /tenants /
-#         2 cost (/summary + /recent) / SSE publish-events 带 id: 行）
+# 4. 验证（应看到 125 routes，含 cost 三端点（summary/recent/timeseries）+
+#         pipelines/user-events SSE + publish-events 带 id: 行）
 .venv/bin/python -c "from app.main import app; print(len(app.routes))"
+
+# 5. 可选：配 SMTP 真发月账单
+#    .env 加 SMTP_HOST / SMTP_USER / SMTP_PASSWORD + INVOICE_EMAIL_ENABLED=true
+#    本地测试可 docker run mailpit/mailpit 起 1025 端口假 SMTP
 ```
 
 **重要**：用户自己重启 backend 时记得 `cd /Users/zhaoguangyuan/project/empty/fliki-clone-api &&
@@ -414,6 +432,10 @@ Brief
 | **Stripe webhook charge.refunded + 6 case 单测** | ✅ | Track-16：alembic head `a1b2c3d4e5f6` → `b2c3d4e5f6a7`，加 `subscriptions.refunded_at TIMESTAMPTZ NULL`（不加 server_default 避免老行误打标 / 不加索引退款查询频次极低 / downgrade `drop_column` 无副作用）；`webhook_handlers.py` 加 `_handle_charge_refunded(charge, *, event_id)`：`metadata.subscription_id` 优先 → `customer` 反查最新订阅；都不命中返 `{handled: True, matched: 0, reason: ...}` 让 stripe 不重投；**只打标 refunded_at**，不动 `tenant_quotas` / `users.plan` / `subscriptions.plan`（v1 用户体验优先；ops 评估后人手降级）；6 case 端到端覆盖 5 类 stripe 事件 + unknown |
 | **SSE 断网重连 last_event_id 续传** | ✅ | Track-17：`services/pipeline/events.py` 升级为 redis Stream + pub/sub 双写：`_publish_to_channel` 加 `XADD {channel}:stream * data <json>`（MAXLEN ~1000 approximate trim）+ `PUBLISH {channel}` 保留兼容；`_subscribe_channel` 改用 `xread({stream: cursor}, block=1000)`，`cursor=last_event_id or "$"`；yield 升级为 3-tuple `(event_type, payload, entry_id)`；`subscribe` / `subscribe_publish_plan` 加 `last_event_id` 透传；XADD 失败不阻塞 PUBLISH；redis 不可用 noop；`routers/{pipelines,production}.py::_sse_format(event, data, event_id=None)` 非空时 emit `id: <event_id>\n` 在 `event:` 之前；两个 SSE 端点从 `request.headers.get("Last-Event-ID")` 透传到 subscribe；浏览器原生 EventSource 自动带 `Last-Event-ID` 头不用前端改；10 case 单测 + 3 case 真连 redis 烟测 |
 | **model_calls 加 tenant_id + 按 tenant 聚合 cost 视图** | ✅ | Track-18：alembic head `b2c3d4e5f6a7` → `c3d4e5f6a7b8`，加 `model_calls.tenant_id VARCHAR(200) NULL` + `ix_model_calls_tenant_id` 索引 + 一次性 backfill 老行为 `'u:' \|\| user_id`（与 `pipeline.tenant.resolve_tenant_id` 兜底约定一致）；`services/model_gateway/cost.py::record_call` 加 `tenant_id` kwarg + `_resolve_tenant_for_record(explicit, user_id)` 公共判定（explicit > `u:{user_id}` > None）；`gateway._record` 透传 `request.tenant_id`；新 `routers/cost.py` 2 端点：`GET /api/cost/summary?tenant_id=&period=monthly\|weekly\|daily` 按 provider 聚合（cost_usd / call_count / success_count / failed_count）+ `GET /api/cost/recent?tenant_id=&limit=`；`_resolve_query_tenant` 安全 helper：未传 → user 自己 / 传了 → 仅 admin 直通否则静默覆盖回自己；前端 `lib/cost.ts` + `pipeline/page.tsx::CostBreakdownPanel` 按 provider 横向 bar 颜色映射（emerald=OpenAI / sky=SiliconFlow / amber=Kling / violet=ElevenLabs / slate=local），与 `refreshQuota` 同生命周期；10 case 单测（4 unit + 6 integration） |
+| **metric dashboard（cost 时序图 + admin metrics 页）** | ✅ | Track-21：`routers/cost.py` 末尾追加 `GET /api/cost/timeseries?tenant_id=&provider=&period=daily\|weekly&days=30`：`DATE_TRUNC('day'/'week', created_at)` GROUP BY day, provider 聚合，返 `[{date, provider, cost_usd, call_count}]`；复用 T-18 `_resolve_query_tenant` 鉴权（admin 邮箱可指定他人）；前端新页 `app/[locale]/(app)/app/admin/metrics/page.tsx` tenant 选择器 + provider 多选 chips + period toggle + recharts LineChart 多 series（每 provider 一条折线）+ 顶部数字 total_cost / total_calls；`lib/cost.ts` 加 `getCostTimeseries`；`sidebar.tsx` admin 渲「Admin · Metrics」入口与 Feature Flags 并列；8 case 单测 |
+| **月账单 PDF + SMTP 邮件（invoice.paid）** | ✅ | Track-22：`requirements.txt` 加 `reportlab>=4.0`；`config.py` 加 5 条 `SMTP_*` 字段 + `invoice_email_enabled: bool = False`（缺省关闭防本地误发）；新 `services/billing/invoice_pdf.py` reportlab 渲 A4 PDF 含 plan + period + 按 provider cost 拆分表格 + 总金额（数据源 stripe invoice.lines + T-18 期内 model_calls）；新 `services/email/{__init__,smtp_client}.py` 薄封装 stdlib smtplib（缺 SMTP 抛 EmailNotConfigured；不引第三方依赖）；`webhook_handlers.py` 加 `invoice.paid` dispatch + `_handle_invoice_paid`：`invoice_email_enabled=False` 返 `{handled:True, sent:False, reason:...}` 让 stripe 不重投；与 T-16 既有 5 handler 共存；7 case 单测 |
+| **ADMIN_EMAILS 迁回 Settings** | ✅ | Track-23：`config.py` 加 `admin_emails: str = "demo@example.com"` 字段（pydantic-settings 自动从 env 读）；`routers/admin_flags.py::_allowed_admins()` 改读 `get_settings().admin_emails`，逗号 split + strip + lower + 去空 + set 化；保留 `demo@example.com` 兜底（dev fixtures 兼容）；T-10/14/18 既有调用方走 `_is_admin_email` 不变；`tests/test_admin_flags.py` 既有 7 case 用 monkeypatch settings 替代 `os.environ.set` 注入；6 case 新单测 |
+| **配额超限 / Provider 桶满 SSE 实时推送** | ✅ | Track-25：`services/pipeline/events.py` 复用 `_publish_to_channel`/`_subscribe_channel` 内核新加 `publish_user_event` + `subscribe_user`，channel `user:{user_id}` 与既有 channel 互斥；继承 T-17 redis Stream + pub/sub 双写 + 断网续传；`quota.reserve_tenant` 抛 402 之前调 `publish_user_event("quota_exceeded", {tenant_id, attempted_cost, monthly_limit, current_usage, deficit_usd})`；`provider_buckets.acquire` BucketFull 调 `publish_user_event("bucket_full", {provider_name, current_in_flight, max_concurrent})`；`gateway.py` 把 user_id 透传给 bucket acquire；新路由 `GET /api/pipelines/user-events` SSE（owner 鉴权 + snapshot+增量）；前端新 `use-user-events.ts` hook + `<UserEventsListener/>` client component 挂在 `(app)/layout.tsx` 全局生效；toast：`feedback.error` quota / `feedback.warning` bucket；10 case 单测 |
 | **多角色锁定 v5（ArtAgent + VideoAgent）** | ✅ | Track-09：v3/v4 只锁主角；v5 升级为「每个 character_card 各一份 anchor」+「按 `shot.focus_character` 逐镜选对应 anchor + 注入对应前缀」；`_select_relevant_characters`（主角永远保留；其余角色被 focus 引用才纳入，不浪费 image 调用）→ `_generate_character_anchors`（批量出 anchor，单个失败不影响其它）→ `_inject_consistency_into_shots(characters_by_name=)`；`_generate_keyframes(anchors_by_role=)` 多角色 anchor URL 字典；VideoAgent `_select_ref_image` 按 `shot.locked_character` / `focus_character` 选对应 anchor，返 `(url, source, anchor_role)`；outputs 新增 `character_anchors`/`shots[i].locked_character`/`ref_anchor_role`/`ref_image_summary.by_role`/`character_anchors_by_role`；前端 ArtArtifact 多角色 grid（主角 emerald / 配角 violet 边框）+ shots 网格 🔒 角标按 `locked_character` 着色；VideoArtifact 头部按角色统计 + 每镜 `ref_anchor_role` 角标；`character_anchor` 单字段保留为主角的（向后兼容前端 v3 徽标 / 旧 video.py）；6 case + 既有 31 case 零回归 |
 | **canary 灰度 / feature_flags v1** | ✅ | Track-10：新表 `feature_flags(id, tenant_id, flag_name, value_json, created_at, updated_at)` + 唯一约束 `(tenant_id, flag_name)`（alembic `a1b2c3d4e5f6`）；`services/pipeline/feature_flags.py`：`get_flag`/`set_flag`（PG `ON CONFLICT` upsert）/`load_for_tenant`（runner build ctx 时一次性批量）/`is_enabled`；value 形态 `{"pct":0..100}`（hash SHA-1 前 8 hex mod 100，bucket < pct 命中）/`{"enabled":bool}`/`{"variant":"v4"/"v3"/"off"}`；`PipelineContext` 加 `feature_flags`/`tenant_id`/`tenant_plan`；ArtAgent 入口读 `art_ipadapter_pct`：缺省→默认 v4；命中→喂 anchor 走 v4 IP-Adapter；不命中→`anchors_url_by_role={}` 主角镜降到 v3 prompt-only（前缀注入仍生效）；outputs 加 `canary_variant`/`canary_flag_value` 可观测；admin 路由 `GET/PUT/DELETE /api/admin/feature-flags`（邮箱白名单 `ADMIN_EMAILS=...`，fallback `demo@example.com`）；4 case 叠加 multichar 烟测 + service 层 hash 染色稳定性烟测 PASS |
 | **Stripe 计费对接 v2 + tenant_quotas 同步** | ✅ | Track-11：6 路由 `/api/billing/{plan,checkout-session,portal-session,checkout(legacy),portal(legacy),webhook}`；`services/billing/`：`stripe_client.py`（薄封装 SDK + `StripeNotConfigured` 翻 503）/`webhook_handlers.py`（4 事件矩阵：`checkout.session.completed` / `customer.subscription.{updated,deleted}` / `invoice.payment_failed`）/`tenant_sync.py`（`sync_user_plan(user_id, new_plan)` 走 `pipeline.tenant.resolve_tenant_id` → `quota.update_tenant_plan`）；`quota.update_tenant_plan(tenant_id, new_plan)` 新加：UPDATE `tenant_quotas.plan` + 升级取 `PLAN_DEFAULTS` bump `monthly_limit_usd`/`concurrent_max`（降级**保留**运维手调过的值）+ 遍历 `provider_concurrency_buckets` 调 `ensure_bucket(plan=new)` 自动 bump per-provider max_concurrent；新前端 `/app/billing` 三栏 plan 卡片（free/standard/premium）+ Active 徽章 + 「升级」跳 Stripe Checkout / 「管理订阅」跳 Customer Portal；`?session_id=` 跳回参数 1.5s 后 refetch；不动 alembic（复用现有 `subscriptions`/`tenant_quotas`/`provider_concurrency_buckets`）；handler dispatch + tenant_sync 单元烟测 PASS（真 Stripe CLI 联调要本地配 `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` 后跑 `stripe trigger checkout.session.completed`）|
@@ -479,14 +501,16 @@ cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && make pipeline-worker
 
 ## 7. 下一会话主线推荐顺序（带工作量估计）
 
-第四波合完后剩余路线（**核心 v1 上线只差 0.5-1 天工作量**）：
+第五波合完后剩余路线（**v1 工程闭环全部就绪；剩余都是外部依赖 / 商务问题 / 长尾**）：
 
 | 优先级 | 任务 | 工作量 | 触发条件 / 价值 |
 |---|---|---|---|
 | ~~★★~~ ✅ 第一+二波 | ~~Voice/Art/Edit/Publish/Quota/Canary/Stripe~~ | ~~10 天~~ | 2026-05-04+05 全 done |
-| ~~★★~~ ✅ 第三波 | ~~T-13 / T-14 / T-15 / T-16 / T-17~~ | ~~2.5 天~~ | **2026-05-05 14:30 全 done** |
-| ~~★★~~ ✅ 第四波 | ~~T-18 model_calls tenant_id + cost 视图~~ | ~~半天~~ | **2026-05-05 15:00 done（89 PASS, alembic c3d4e5f6a7b8）** |
-| ★★ | **YouTube 真账号 e2e + Stripe 真账号 e2e** | 半天 | 都是协议链路已通，只差用户配真 key + 跑一次：Track-13 chunked PUT 协议层 mock 测过；Track-16 webhook 单测覆盖 5 事件；用户在 `.env` 配 `GOOGLE_CLIENT_ID/SECRET` + `STRIPE_SECRET_KEY/STRIPE_WEBHOOK_SECRET` 后跑一次 60MB 视频真上传 + 一次 4242 卡 checkout 即可 |
+| ~~★★~~ ✅ 第三波 | ~~T-13 / T-14 / T-15 / T-16 / T-17~~ | ~~2.5 天~~ | 2026-05-05 14:30 全 done |
+| ~~★~~ ✅ 第四波 | ~~T-18 model_calls tenant_id + cost 视图~~ | ~~半天~~ | 2026-05-05 15:00 done |
+| ~~★~~ ✅ 第五波 | ~~T-21 / T-22 / T-23 / T-25~~ | ~~3 天~~ | **2026-05-05 15:50 全 done（120 PASS）** |
+| ★★ | **T-20 YouTube + Stripe 真账号 e2e** | 半天（**非代码**）| 链路全通只差用户配真 key + 跑一次：Track-13 chunked PUT + Track-16 webhook + Track-22 invoice 邮件全覆盖；用户配 `.env` 后跑一次 60MB 视频真上传 + 4242 卡 checkout + dashboard refund 一次即可；写 `E2E_VERIFY_REPORT.md` 留档 |
+| ★★ | **T-24 真 RBAC（workspace member role）** | 1.5 天 | T-23 已合（`admin_emails` 在 Settings）；本 Track 在其上加 `team_members.role`（admin/editor/viewer）+ `services/auth/rbac.py` + 替换 `_require_admin` 邮箱白名单；新 alembic `d4e5f6a7b8c9` 顶 `c3d4e5f6a7b8` |
 | ★★ | **T-12 bilibili 自动发布**（依赖商务）| 2-3 天 | 等 MCN/合作伙伴入驻拿 OpenAPI；adapter stub 已留好 |
 | ★ | **T-19 ArtAgent v6 真 multi-IP**（外部依赖）| 1-1.5 天 | 等 SiliconFlow Kolors-IP / Replicate Flux Redux 上 multi-IP 端点；当前 Track-09 `anchors_by_role` 接入点已留 |
 | ★ | **L-04 月账单 PDF + 邮件** | 1 天 | Track-11 follow-up：拿 stripe `invoice.paid` 渲染 PDF + 邮件 |
@@ -640,24 +664,26 @@ Redis 在跑（`redis-cli ping → PONG`）。
 ```
 延续 2026-05-04 + 05-05 全天会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
 仓库：https://github.com/gyzhao666-tech/fliki-clone（monorepo）。
-当前能跑 video_full 端到端 + 全发布闭环 + cost 可观测：配额 v2 tenant + provider 桶 +
-按 tenant 聚合的 model_calls 成本视图（含 provider 横向 bar）/ VoiceAgent v4 word-level /
+v1 工程闭环全部就绪。当前能力：video_full 端到端 + 全发布闭环 + cost 可观测 + admin 后台 +
+配额超限实时 toast + 月账单自动邮件：配额 v2 tenant + provider 桶 + 按 tenant 聚合的
+model_calls 成本视图（含 provider 横向 bar + 时序折线 dashboard）/ VoiceAgent v4 word-level /
 ArtAgent v3+v4+v5（多角色 anchor 按 shot.focus_character 逐镜选 + canary 按 tenant_id
 hash 染色 v4↔v3-prompt-only）/ VideoAgent v2 i2v 多角色 anchor / EditAgent v5 /
 发布执行器 v1（dry-run/youtube/bilibili，YouTube 升级 8 MiB chunked PUT + 进度回写
 SSE 不再卡 1080p timeout / Fernet 凭证加密 / OAuth）+ publish 异步化（celery + SSE
 phase 流 + last_event_id 断网续传）/ DLQ retry 按 task_name 路由 / feature_flags v1 +
-后端 admin 路由 + 前端 admin 管理面板 / Stripe 计费 v2 含 charge.refunded 退款打标 /
-DAG 视图 / pytest 89 case 全过。
+后端 admin 路由 + 前端 admin Feature Flags 管理面板 + admin Metrics dashboard /
+Stripe 计费 v2 含 charge.refunded 退款打标 + invoice.paid 月账单 PDF 邮件 /
+配额超限 / Provider 桶满 SSE 实时 toast / ADMIN_EMAILS 落 Settings / DAG 视图 /
+pytest 120 case 全过。
 请直接做（除非我另说）：
-(A) YouTube + Stripe 真账号 e2e（半天，链路全通只差用户 .env 配真 key）；
-(B) T-12 bilibili 自动发布（等 MCN，2-3 天，商务问题）；
-(C) T-19 ArtAgent v6 真 multi-IP（等 SiliconFlow / Replicate 端点，外部依赖）；
-(D) L-03 metric dashboard 升级（用 T-18 已写入的 tenant_id 列做按天 / provider 时序图）；
-(E) L-04 月账单 PDF + 邮件（拿 stripe invoice.paid 渲染）。
+(A) T-20 YouTube + Stripe 真账号 e2e（半天，**非代码工作**：用户配 .env 真 key 跑一次完整链路 + 写 E2E_VERIFY_REPORT.md）；
+(B) T-24 真 RBAC（1.5 天，依赖 T-23 已合）；
+(C) T-12 bilibili 自动发布（等 MCN，2-3 天，商务问题）；
+(D) T-19 ArtAgent v6 真 multi-IP（等 SiliconFlow / Replicate 端点，外部依赖）。
 开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 c3d4e5f6a7b8；
-            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 89 PASS；
-            (5) 重启 backend 才会加载第二+三+四波 10 条 Track 新代码（pid 30876 仍在 11:13 旧版）；
+            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 120 PASS；
+            (5) 重启 backend 才会加载第二+三+四+五波 14 条 Track 新代码（pid 30876 仍在 11:13 旧版）；
             (6) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
 ```
 

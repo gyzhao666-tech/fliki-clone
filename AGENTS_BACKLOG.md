@@ -1,16 +1,16 @@
-# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 Track 全部已合并）
+# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 Track 全部已合并）
 
 > 这份是**给每个 Cursor Agent Window 看的**：进入仓库第一件事 read 这份，找你的 Track，按规则执行。
 > 协调者：人类（用户）；分支合并、SESSION_HANDOFF.md 更新由人类（或最后一个 agent）统一负责。
 
-## 0. 仓库 / 进程现状（2026-05-05 15:00 更新）
+## 0. 仓库 / 进程现状（2026-05-05 15:50 更新）
 
 - **GitHub**：https://github.com/gyzhao666-tech/fliki-clone（monorepo：`fliki-clone-api/` + `fliki-clone/`）
 - **本地仓库根**：`/Users/zhaoguangyuan/project/empty/`
-- **基线**：`main` @ `a3c7576 Merge track-18-model-calls-tenant`（第四波最后一条）
-- **alembic head**：**`c3d4e5f6a7b8`**（含 `model_calls.tenant_id` 列 + 索引 + backfill；已落 DB；不要重复跑）
+- **基线**：`main` @ `8758721 Merge track-23-admin-emails-settings`（第五波最后一条）
+- **alembic head**：**`c3d4e5f6a7b8`**（含 `model_calls.tenant_id`；第五波没动 schema；已落 DB；不要重复跑）
 - **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；
-  **第二+三+四波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
+  **第二+三+四+五波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
   ```bash
   kill 30876
   cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
@@ -18,7 +18,7 @@
   ```
   **不要带 `--reload`**（会启 Python 3.12 子进程，import error）
 - **前端进程**：pid `8947`，3000 端口；hot-reload 自动生效不用重启
-- **测试基线**：`cd fliki-clone-api && make test` 应得 **89 passed**；改完代码前后都跑一遍
+- **测试基线**：`cd fliki-clone-api && make test` 应得 **120 passed**；改完代码前后都跑一遍
 - **背景知识必读**：`SESSION_HANDOFF.md`（项目当前能力 / 已知坑 / 配置约束）
 
 ## 0.1 第一波 7 Track 合并状态（2026-05-05 12:35 完成）
@@ -80,6 +80,25 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 无合并冲突。alembic 双向迁移测过（upgrade → downgrade -1 → upgrade，列消失再回来不丢数据）。
 全量 pytest 89 PASS（79 baseline + 10 新增 4 unit + 6 integration）。
 
+## 0.5 第五波 4 Track 合并状态（2026-05-05 15:50 完成）
+
+合并顺序：T-25 → T-22 → T-21 → T-23（T-23 留最后吸收 `.env.example` SMTP_*+ADMIN_EMAILS 区域冲突；
+`config.py` 由 git auto-merge 自动并入两组字段：T-22 加 SMTP_* 在 stripe_price_* 之后，T-23 加 admin_emails 在末尾）。
+
+| Track | 状态 | 合并 commit |
+|---|---|---|
+| 25 配额超限 / Provider 桶满 SSE 实时推送 | ✅ | `c543ed1` |
+| 22 月账单 PDF + SMTP 邮件（invoice.paid） | ✅ | `cf7eb19` |
+| 21 metric dashboard（cost 时序图 + admin metrics 页） | ✅ | `315cdd0` |
+| 23 ADMIN_EMAILS 迁回 Settings | ✅ | `8758721` |
+
+合并冲突一处（已解决）：`fliki-clone-api/.env.example` 顶部段。
+T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 想加 ADMIN_EMAILS 紧随其后。
+解法：保留 T-22 SMTP 段完整 + T-23 ADMIN_EMAILS 段紧跟其后，用空行隔开；`config.py` 自动合并通过。
+
+`alembic head` 仍是 `c3d4e5f6a7b8`（本批没人占迁移槽，T-24 留下次）。
+全量 pytest 120 PASS（89 baseline + 10 T-25 + 7 T-22 + 8 T-21 + 6 T-23）。
+
 ## 1. 通用规则（所有 agent 必须遵守）
 
 1. **每个 Track 一条 feature branch**（已预创建）；进入工作前：
@@ -87,9 +106,9 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
    git checkout track-XX-<your-track>
    ```
 2. **不要切换分支**；不要 rebase / merge main；改完留 commit 在 feature branch 上，由人类合并。
-3. **alembic 互斥锁**：第五波（待派）暂未占用迁移槽；新 Track 加列时各自约定 rev id（顶 `c3d4e5f6a7b8`），多个 Track 同时加 schema 需要协调者串行合并。
-4. **`.env` 互斥锁**：先看 `app/config.py` 是否已有所需字段；新增 settings 字段单独留一个 Track 处理，不要在普通业务 Track 里夹带。
-5. **`pipeline/page.tsx` 大文件分段**：每个 Track 卡片必须明确指定动哪个子组件 / hook，不要越界。
+3. **alembic 互斥锁**：第六波本批中**只有 Track-24** 占用迁移槽（rev `d4e5f6a7b8c9` 顶 `c3d4e5f6a7b8`）。其它 Track 禁止改 schema；需要新字段优先用 `meta_json` / `outputs_json` 等已有 JSON 列承载。
+4. **`.env` 互斥锁**：第六波本批不需要改 `.env` / `app/config.py`（`admin_emails` / SMTP_* / STRIPE_* / ADMIN_EMAILS 都已就绪）。
+5. **`pipeline/page.tsx` 大文件分段**：T-24 不动此文件。每个 Track 卡片必须明确指定动哪个子组件 / hook，不要越界。
 6. **commit 完整性 ★ T-14 教训**：完成代码后**必须** `git status` 确认 working tree clean 才算交付（第三波 T-14 写完代码忘 commit + NOTES，让协调者收口）。
 7. **commit message 风格**：参考 baseline；中英混合 OK；要写**为什么**（why）而非只列 what。
 8. **完成后写一份 `TRACK_<ID>_NOTES.md` 在仓库根**：包含：
@@ -285,18 +304,11 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
 
 ## 2.6 第四波（已全部 merge，留作历史档案）
 
-> **以下 1 条已合并到 main**（见 0.4 表）。新派发请直接看 2.7 节第五波候选。
+> **以下 1 条已合并到 main**（见 0.4 表）。新派发请直接看 2.8 节第六波。
 
-### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
+## 2.7 第五波（已全部 merge，留作历史档案）
 
-- **分支**：`track-19-multi-ip-adapter`（不创建本地分支，标 ⏸）
-- **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
-
-## 2.7 第五波（4 条 feature 分支已预创建本地；T-24 待 T-23 合并后再派；T-20 协调者自跑）
-
-> 派发原则：本批 5 条同时派发（T-20 协调者自跑不算 agent）；alembic 互斥锁本批没人占用（T-24 ⏸ 待 T-23）；
-> `routers/admin_flags.py` 的 `_is_admin_email` / `_require_admin` 由 T-23 独占，T-24 必须等 T-23 合并后再派。
-> 累计工作量 ≈ 0.5 + 1.5 + 1 + 0.5 + 0.5 = 4 天（4 个 agent 并行 ≈ 1.5 天墙钟，再加 T-24 串行 1.5 天）。
+> **以下 4 条已合并到 main**（见 0.5 表）。新派发请直接看 2.8 节第六波。
 
 ### Track-20 · YouTube + Stripe 真账号 e2e（**协调者自跑，不开 Agent**）★★ (半天)
 
@@ -410,6 +422,46 @@ outputs 同时保留 `character_anchors`（v5）+ `canary_variant`/`canary_flag_
   - 单元：mock redis client 断 publish_user_event 被调 + payload 正确
   - 集成：起 redis → reserve 真超限 → 第二个进程订阅 user channel 应收到事件
 - **不做**：前端 toast 节流 / 去重（v1 简单 toast 即可）；不影响 pipeline / publish_plan 既有 SSE
+
+## 2.8 第六波（**T-24 本地分支已预创建**；T-19 / T-20 仍待外部）
+
+### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
+
+- **分支**：`track-19-multi-ip-adapter`（不创建本地分支，标 ⏸）
+- **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
+
+### Track-20 · YouTube + Stripe 真账号 e2e（**协调者自跑，不开 Agent**）★★ (半天)
+
+- 不创建 feature branch（不动代码）
+- 见 SESSION_HANDOFF.md「T-20 协调者自跑指南」段；交付物：`E2E_VERIFY_REPORT.md`（截图 + log + 通过结论）
+
+### Track-24 · L-05 真 RBAC（workspace member role）★ (1.5 天)
+
+- **分支**：`track-24-rbac-workspace-role`（已本地预创建在 `8758721` 之后）
+- **目标**：把 admin 邮箱白名单升级为 workspace member role（`admin` / `editor` / `viewer`）；T-23 已把 `admin_emails` 落到 `Settings`，本 Track 在其上做 fallback；老 `demo@example.com` 兼容保留
+- **修改文件**：
+  - **新 alembic** `fliki-clone-api/alembic/versions/20260505_1700_add_team_member_role.py`（rev `d4e5f6a7b8c9` 顶 `c3d4e5f6a7b8`）：`team_members` 加 `role: VARCHAR(20) DEFAULT 'editor'` 列 + 普通索引；一次性 backfill：workspace owner = `admin`（`UPDATE team_members tm SET role='admin' FROM workspaces w WHERE tm.workspace_id=w.id AND tm.user_id=w.owner_id`）；其它行保留 default `editor`
+  - `fliki-clone-api/app/models/team.py`（或对应 ORM 模块）：`TeamMember` 加 `role: Mapped[str]`
+  - **新模块** `fliki-clone-api/app/services/auth/__init__.py` + `rbac.py`：
+    - `get_user_role(user_id, workspace_id) -> "admin"|"editor"|"viewer"|None`
+    - `is_admin(user_id, *, workspace_id=None, email=None) -> bool`：先查 team_member.role==admin；workspace_id 缺失时遍历用户所有 workspace 取最高权限；最终 fallback `_is_admin_email(email)`（兼容 demo@example.com）
+    - 60s 内存缓存（同 Track-10 `tenant.py` pattern）
+  - `fliki-clone-api/app/routers/admin_flags.py::_require_admin`：改用 `rbac.is_admin(current_user.id, email=current_user.email)`，邮箱白名单作为兜底兼容
+  - `fliki-clone-api/app/routers/cost.py::_resolve_query_tenant`：admin 判定同样切到 `rbac.is_admin(...)`
+  - 前端 `lib/admin-flags.ts::getAdminMe` 返 schema 不变（`is_admin: bool` 仍来自后端 `is_admin(...)` 判定）
+  - 新 `fliki-clone-api/tests/test_track24_rbac.py` 8+ case：alembic 列存在 / role default editor / owner backfill 为 admin / get_user_role 三状态 / is_admin 邮箱兜底 / is_admin team_member 命中 / cache TTL 行为 / `_require_admin` 集成
+- **互斥锁（独占）**：
+  - alembic 槽 rev `d4e5f6a7b8c9`（独占第六波迁移）
+  - `models/team.py::TeamMember` 加 `role` 字段（小段独占）
+  - 新模块 `services/auth/rbac.py`
+  - `routers/admin_flags.py::_require_admin` 函数体（小段独占；T-23 已合，`_is_admin_email` 不变作为兜底）
+  - `routers/cost.py::_resolve_query_tenant` 函数体（小段独占；admin 判定切到 rbac）
+- **依赖**：✅ T-23 已合（`admin_emails` 在 Settings；`_is_admin_email` 是 fallback 调用方）
+- **烟测**：
+  - alembic upgrade head + downgrade -1 + upgrade（保证可逆）
+  - 单元：rbac.is_admin 三路径（team_member.role / 邮箱白名单 / 都不命中）
+  - 集成：seed 一个 user 是 workspace owner → role 自动 backfill 为 admin → `_require_admin` 通过；demo@example.com fallback 不依赖 team_member 仍通过
+- **不做**：editor / viewer 实际权限分级（v1 只识别 admin vs 非 admin；编辑权限分级是 L-05 真做时的事）；workspace 切换 UI（前端用第一个有权限的 workspace 即可）
 
 ## 3. 长尾（任意时机）
 
