@@ -16,6 +16,9 @@ class Subscription(Base):
     plan: Mapped[str] = mapped_column(String(50), nullable=False)  # free|standard|premium
     status: Mapped[str] = mapped_column(String(50), default="active")  # active|canceled|past_due
     current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Track-16: stripe `charge.refunded` 事件落到本订阅的时刻；NULL = 未退款。
+    # 不联动 tenant_quotas（保留当月配额，由 ops 人工评估）。
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
