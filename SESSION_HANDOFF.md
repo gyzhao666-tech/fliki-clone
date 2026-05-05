@@ -1,7 +1,21 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：核心 v1 全闭环 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：v1 工程闭环全部收口 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 = 22 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 16:30 更新：**Track-24 RBAC v1 已合并到 main**（`pytest 130/130 PASS`）。
+> 第六波 1 Track（T-24）；alembic head 升到 **`d4e5f6a7b8c9`**（顶 `c3d4e5f6a7b8`，
+> `team_members.role` 列 + ix 索引 + 一次性 backfill workspace owner = `admin`）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 24 RBAC v1（workspace member role + 邮箱白名单 fallback）| `team_members` 加 `role: VARCHAR(20) DEFAULT 'editor'` 列 + index；alembic 一次性 backfill：`UPDATE team_members tm SET role='admin' FROM workspaces w WHERE tm.workspace_id=w.id AND tm.user_id=w.owner_id`（owner 自动 admin，其他保留 editor）；新模块 `services/auth/{__init__,rbac}.py`：`get_user_role(user_id, workspace_id)` + `is_admin(user_id, *, workspace_id=None, email=None)` 三路径（explicit workspace → 任意 workspace → 邮箱白名单 fallback）+ 60s 内存缓存（同 `pipeline/tenant.py` pattern）；`routers/admin_flags.py::_require_admin` + `routers/cost.py::_resolve_query_tenant` admin 判定切到 `rbac.is_admin`，`_is_admin_email` 保留作 fallback 兜底（不删，dev `demo@example.com` 兼容）；前端 `lib/admin-flags.ts::getAdminMe` 返 schema 不变；10 case 单测覆盖三路径 + cache TTL + alembic 列存在 + owner backfill |
+>
+> **整体能力扩展**：admin 后台从邮箱白名单升级为 workspace member role（admin/editor/viewer），与 multi-tenant 配额体系（Track-09 多角色 / Track-10 canary / Track-18 model_calls.tenant_id）一致；为后续 workspace 协作权限分级（editor 改改、viewer 只看）打下基础。
+
+> **🎉 v1 工程闭环全部收口**：22 个 Track 合并完毕（10 天工作量浓缩在一天），`pytest 130 PASS`，
+> 5 条 alembic 迁移全落库，125+1=126 路由（含 v1 全部业务 + admin + cost + RBAC）。
+> 距离真正上线只差 **T-20 真账号 e2e**（半天，**非代码**：用户配 `.env` 真 key 跑一次完整链路）。
 
 > 2026-05-05 15:50 更新：**多 Agent 第五波 4 Track 已合并到 main**（`pytest 120/120 PASS`）。
 > 合并顺序：T-25 → T-22 → T-21 → T-23（T-23 留最后吸收 `.env.example` 顶部 SMTP_* + ADMIN_EMAILS 区域冲突；
@@ -136,32 +150,37 @@
 ## 2026-05-05 当前进程（最新）
 
 - **后端 pid 30876**（仍在 11:13 启的旧进程；监听 `127.0.0.1:8000`，无 proxy 污染；
-  代码改了未重启 → **下次重启会加载第二+三+四+五波 14 条 Track 新代码 + alembic head `c3d4e5f6a7b8`**）
+  代码改了未重启 → **下次重启会加载第二+三+四+五+六波 15 条 Track 新代码 + alembic head `d4e5f6a7b8c9`**）
 - **前端 pid 8947**（next dev，3000 端口，hot-reload 自动生效；
-  第五波前端改动（admin metrics 页 + cost panel + UserEventsListener 全局 toast）已 hot-reload）
+  T-24 不动前端无需关心；既有第五波前端改动（admin metrics 页 + cost panel +
+  UserEventsListener 全局 toast）已 hot-reload）
 
-**第五波合并后必做**：
+**v1 收口后必做**：
 
 ```bash
 # 1. 停旧 backend（pid 30876）
 kill 30876
 
-# 2. 跑 alembic（落第二+三+四波 4 条迁移：feature_flags + subscriptions.refunded_at +
-#               model_calls.tenant_id + backfill；第五波没动 schema）
+# 2. 跑 alembic（落 5 条迁移：feature_flags + subscriptions.refunded_at +
+#               model_calls.tenant_id + backfill + team_members.role + backfill）
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
-  .venv/bin/python -m alembic upgrade head   # → c3d4e5f6a7b8
+  .venv/bin/python -m alembic upgrade head   # → d4e5f6a7b8c9
 
 # 3. 启新 backend（不带 --reload）
 cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
   .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 
-# 4. 验证（应看到 125 routes，含 cost 三端点（summary/recent/timeseries）+
-#         pipelines/user-events SSE + publish-events 带 id: 行）
+# 4. 验证（应看到 125 routes，含 cost 三端点 / pipelines/user-events SSE /
+#         publish-events 带 id: 行 / admin_flags 含 /me + /tenants）
 .venv/bin/python -c "from app.main import app; print(len(app.routes))"
 
-# 5. 可选：配 SMTP 真发月账单
-#    .env 加 SMTP_HOST / SMTP_USER / SMTP_PASSWORD + INVOICE_EMAIL_ENABLED=true
-#    本地测试可 docker run mailpit/mailpit 起 1025 端口假 SMTP
+# 5. RBAC 验证：用 demo@example.com 登录访问 /app/admin/feature-flags 看入口
+#               psql 验证：SELECT user_id, role FROM team_members WHERE role='admin'
+#               应看到所有 workspace owner 自动是 admin
+
+# 6. 可选：配 SMTP 真发月账单 / 配 STRIPE / GOOGLE 跑 T-20 真账号 e2e
+#    SMTP：.env 加 SMTP_HOST / SMTP_USER / SMTP_PASSWORD + INVOICE_EMAIL_ENABLED=true
+#    Stripe + YouTube：见第 7 节 T-20 操作指南
 ```
 
 **重要**：用户自己重启 backend 时记得 `cd /Users/zhaoguangyuan/project/empty/fliki-clone-api &&
@@ -436,6 +455,7 @@ Brief
 | **月账单 PDF + SMTP 邮件（invoice.paid）** | ✅ | Track-22：`requirements.txt` 加 `reportlab>=4.0`；`config.py` 加 5 条 `SMTP_*` 字段 + `invoice_email_enabled: bool = False`（缺省关闭防本地误发）；新 `services/billing/invoice_pdf.py` reportlab 渲 A4 PDF 含 plan + period + 按 provider cost 拆分表格 + 总金额（数据源 stripe invoice.lines + T-18 期内 model_calls）；新 `services/email/{__init__,smtp_client}.py` 薄封装 stdlib smtplib（缺 SMTP 抛 EmailNotConfigured；不引第三方依赖）；`webhook_handlers.py` 加 `invoice.paid` dispatch + `_handle_invoice_paid`：`invoice_email_enabled=False` 返 `{handled:True, sent:False, reason:...}` 让 stripe 不重投；与 T-16 既有 5 handler 共存；7 case 单测 |
 | **ADMIN_EMAILS 迁回 Settings** | ✅ | Track-23：`config.py` 加 `admin_emails: str = "demo@example.com"` 字段（pydantic-settings 自动从 env 读）；`routers/admin_flags.py::_allowed_admins()` 改读 `get_settings().admin_emails`，逗号 split + strip + lower + 去空 + set 化；保留 `demo@example.com` 兜底（dev fixtures 兼容）；T-10/14/18 既有调用方走 `_is_admin_email` 不变；`tests/test_admin_flags.py` 既有 7 case 用 monkeypatch settings 替代 `os.environ.set` 注入；6 case 新单测 |
 | **配额超限 / Provider 桶满 SSE 实时推送** | ✅ | Track-25：`services/pipeline/events.py` 复用 `_publish_to_channel`/`_subscribe_channel` 内核新加 `publish_user_event` + `subscribe_user`，channel `user:{user_id}` 与既有 channel 互斥；继承 T-17 redis Stream + pub/sub 双写 + 断网续传；`quota.reserve_tenant` 抛 402 之前调 `publish_user_event("quota_exceeded", {tenant_id, attempted_cost, monthly_limit, current_usage, deficit_usd})`；`provider_buckets.acquire` BucketFull 调 `publish_user_event("bucket_full", {provider_name, current_in_flight, max_concurrent})`；`gateway.py` 把 user_id 透传给 bucket acquire；新路由 `GET /api/pipelines/user-events` SSE（owner 鉴权 + snapshot+增量）；前端新 `use-user-events.ts` hook + `<UserEventsListener/>` client component 挂在 `(app)/layout.tsx` 全局生效；toast：`feedback.error` quota / `feedback.warning` bucket；10 case 单测 |
+| **RBAC v1（workspace member role + 邮箱白名单 fallback）** | ✅ | Track-24：alembic head `c3d4e5f6a7b8` → `d4e5f6a7b8c9`，加 `team_members.role VARCHAR(20) DEFAULT 'editor'` + `ix_team_members_role` 索引 + 一次性 backfill workspace owner 设为 `admin`；新模块 `services/auth/{__init__.py, rbac.py}`：`get_user_role(user_id, workspace_id) -> "admin"\|"editor"\|"viewer"\|None` + `is_admin(user_id, *, workspace_id=None, email=None)` 三路径（explicit workspace → 任意 workspace → 邮箱白名单 fallback）+ 60s 内存缓存（同 `pipeline.tenant.resolve_tenant_id` pattern）；`routers/admin_flags.py::_require_admin` + `routers/cost.py::_resolve_query_tenant` admin 判定切到 `rbac.is_admin(...)`，`_is_admin_email` 保留作 fallback 兜底（不删，dev fixtures `demo@example.com` 仍生效）；前端 `lib/admin-flags.ts::getAdminMe` 返 schema 不变；10 case 单测覆盖三路径 + cache TTL + alembic 列存在 + owner backfill |
 | **多角色锁定 v5（ArtAgent + VideoAgent）** | ✅ | Track-09：v3/v4 只锁主角；v5 升级为「每个 character_card 各一份 anchor」+「按 `shot.focus_character` 逐镜选对应 anchor + 注入对应前缀」；`_select_relevant_characters`（主角永远保留；其余角色被 focus 引用才纳入，不浪费 image 调用）→ `_generate_character_anchors`（批量出 anchor，单个失败不影响其它）→ `_inject_consistency_into_shots(characters_by_name=)`；`_generate_keyframes(anchors_by_role=)` 多角色 anchor URL 字典；VideoAgent `_select_ref_image` 按 `shot.locked_character` / `focus_character` 选对应 anchor，返 `(url, source, anchor_role)`；outputs 新增 `character_anchors`/`shots[i].locked_character`/`ref_anchor_role`/`ref_image_summary.by_role`/`character_anchors_by_role`；前端 ArtArtifact 多角色 grid（主角 emerald / 配角 violet 边框）+ shots 网格 🔒 角标按 `locked_character` 着色；VideoArtifact 头部按角色统计 + 每镜 `ref_anchor_role` 角标；`character_anchor` 单字段保留为主角的（向后兼容前端 v3 徽标 / 旧 video.py）；6 case + 既有 31 case 零回归 |
 | **canary 灰度 / feature_flags v1** | ✅ | Track-10：新表 `feature_flags(id, tenant_id, flag_name, value_json, created_at, updated_at)` + 唯一约束 `(tenant_id, flag_name)`（alembic `a1b2c3d4e5f6`）；`services/pipeline/feature_flags.py`：`get_flag`/`set_flag`（PG `ON CONFLICT` upsert）/`load_for_tenant`（runner build ctx 时一次性批量）/`is_enabled`；value 形态 `{"pct":0..100}`（hash SHA-1 前 8 hex mod 100，bucket < pct 命中）/`{"enabled":bool}`/`{"variant":"v4"/"v3"/"off"}`；`PipelineContext` 加 `feature_flags`/`tenant_id`/`tenant_plan`；ArtAgent 入口读 `art_ipadapter_pct`：缺省→默认 v4；命中→喂 anchor 走 v4 IP-Adapter；不命中→`anchors_url_by_role={}` 主角镜降到 v3 prompt-only（前缀注入仍生效）；outputs 加 `canary_variant`/`canary_flag_value` 可观测；admin 路由 `GET/PUT/DELETE /api/admin/feature-flags`（邮箱白名单 `ADMIN_EMAILS=...`，fallback `demo@example.com`）；4 case 叠加 multichar 烟测 + service 层 hash 染色稳定性烟测 PASS |
 | **Stripe 计费对接 v2 + tenant_quotas 同步** | ✅ | Track-11：6 路由 `/api/billing/{plan,checkout-session,portal-session,checkout(legacy),portal(legacy),webhook}`；`services/billing/`：`stripe_client.py`（薄封装 SDK + `StripeNotConfigured` 翻 503）/`webhook_handlers.py`（4 事件矩阵：`checkout.session.completed` / `customer.subscription.{updated,deleted}` / `invoice.payment_failed`）/`tenant_sync.py`（`sync_user_plan(user_id, new_plan)` 走 `pipeline.tenant.resolve_tenant_id` → `quota.update_tenant_plan`）；`quota.update_tenant_plan(tenant_id, new_plan)` 新加：UPDATE `tenant_quotas.plan` + 升级取 `PLAN_DEFAULTS` bump `monthly_limit_usd`/`concurrent_max`（降级**保留**运维手调过的值）+ 遍历 `provider_concurrency_buckets` 调 `ensure_bucket(plan=new)` 自动 bump per-provider max_concurrent；新前端 `/app/billing` 三栏 plan 卡片（free/standard/premium）+ Active 徽章 + 「升级」跳 Stripe Checkout / 「管理订阅」跳 Customer Portal；`?session_id=` 跳回参数 1.5s 后 refetch；不动 alembic（复用现有 `subscriptions`/`tenant_quotas`/`provider_concurrency_buckets`）；handler dispatch + tenant_sync 单元烟测 PASS（真 Stripe CLI 联调要本地配 `STRIPE_SECRET_KEY` + `STRIPE_WEBHOOK_SECRET` 后跑 `stripe trigger checkout.session.completed`）|
@@ -501,16 +521,16 @@ cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && make pipeline-worker
 
 ## 7. 下一会话主线推荐顺序（带工作量估计）
 
-第五波合完后剩余路线（**v1 工程闭环全部就绪；剩余都是外部依赖 / 商务问题 / 长尾**）：
+第六波合完后剩余路线（**v1 工程闭环全部就绪；剩余都是外部依赖 / 商务问题 / 长尾**）：
 
 | 优先级 | 任务 | 工作量 | 触发条件 / 价值 |
 |---|---|---|---|
 | ~~★★~~ ✅ 第一+二波 | ~~Voice/Art/Edit/Publish/Quota/Canary/Stripe~~ | ~~10 天~~ | 2026-05-04+05 全 done |
 | ~~★★~~ ✅ 第三波 | ~~T-13 / T-14 / T-15 / T-16 / T-17~~ | ~~2.5 天~~ | 2026-05-05 14:30 全 done |
 | ~~★~~ ✅ 第四波 | ~~T-18 model_calls tenant_id + cost 视图~~ | ~~半天~~ | 2026-05-05 15:00 done |
-| ~~★~~ ✅ 第五波 | ~~T-21 / T-22 / T-23 / T-25~~ | ~~3 天~~ | **2026-05-05 15:50 全 done（120 PASS）** |
+| ~~★~~ ✅ 第五波 | ~~T-21 / T-22 / T-23 / T-25~~ | ~~3 天~~ | 2026-05-05 15:50 全 done（120 PASS）|
+| ~~★★~~ ✅ 第六波 | ~~T-24 真 RBAC（workspace member role）~~ | ~~1.5 天~~ | **2026-05-05 16:30 done（130 PASS, alembic d4e5f6a7b8c9）** |
 | ★★ | **T-20 YouTube + Stripe 真账号 e2e** | 半天（**非代码**）| 链路全通只差用户配真 key + 跑一次：Track-13 chunked PUT + Track-16 webhook + Track-22 invoice 邮件全覆盖；用户配 `.env` 后跑一次 60MB 视频真上传 + 4242 卡 checkout + dashboard refund 一次即可；写 `E2E_VERIFY_REPORT.md` 留档 |
-| ★★ | **T-24 真 RBAC（workspace member role）** | 1.5 天 | T-23 已合（`admin_emails` 在 Settings）；本 Track 在其上加 `team_members.role`（admin/editor/viewer）+ `services/auth/rbac.py` + 替换 `_require_admin` 邮箱白名单；新 alembic `d4e5f6a7b8c9` 顶 `c3d4e5f6a7b8` |
 | ★★ | **T-12 bilibili 自动发布**（依赖商务）| 2-3 天 | 等 MCN/合作伙伴入驻拿 OpenAPI；adapter stub 已留好 |
 | ★ | **T-19 ArtAgent v6 真 multi-IP**（外部依赖）| 1-1.5 天 | 等 SiliconFlow Kolors-IP / Replicate Flux Redux 上 multi-IP 端点；当前 Track-09 `anchors_by_role` 接入点已留 |
 | ★ | **L-04 月账单 PDF + 邮件** | 1 天 | Track-11 follow-up：拿 stripe `invoice.paid` 渲染 PDF + 邮件 |
@@ -544,7 +564,8 @@ fliki-clone-api/
 │   ├── 20260505_1200_add_publish_plan_confirm_real.py (rev 9c2d4e5f6a7b)
 │   ├── 20260505_1300_add_feature_flags.py (rev a1b2c3d4e5f6)  ← Track-10
 │   ├── 20260505_1500_add_subscription_refunded_at.py (rev b2c3d4e5f6a7)  ← Track-16
-│   └── 20260505_1600_add_model_calls_tenant_id.py (rev c3d4e5f6a7b8)  ← head ★ Track-18
+│   ├── 20260505_1600_add_model_calls_tenant_id.py (rev c3d4e5f6a7b8)  ← Track-18
+│   └── 20260505_1700_add_team_member_role.py (rev d4e5f6a7b8c9)  ← head ★ Track-24
 ├── app/
 │   ├── main.py
 │   ├── config.py
@@ -664,26 +685,31 @@ Redis 在跑（`redis-cli ping → PONG`）。
 ```
 延续 2026-05-04 + 05-05 全天会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
 仓库：https://github.com/gyzhao666-tech/fliki-clone（monorepo）。
-v1 工程闭环全部就绪。当前能力：video_full 端到端 + 全发布闭环 + cost 可观测 + admin 后台 +
-配额超限实时 toast + 月账单自动邮件：配额 v2 tenant + provider 桶 + 按 tenant 聚合的
-model_calls 成本视图（含 provider 横向 bar + 时序折线 dashboard）/ VoiceAgent v4 word-level /
-ArtAgent v3+v4+v5（多角色 anchor 按 shot.focus_character 逐镜选 + canary 按 tenant_id
-hash 染色 v4↔v3-prompt-only）/ VideoAgent v2 i2v 多角色 anchor / EditAgent v5 /
-发布执行器 v1（dry-run/youtube/bilibili，YouTube 升级 8 MiB chunked PUT + 进度回写
-SSE 不再卡 1080p timeout / Fernet 凭证加密 / OAuth）+ publish 异步化（celery + SSE
-phase 流 + last_event_id 断网续传）/ DLQ retry 按 task_name 路由 / feature_flags v1 +
-后端 admin 路由 + 前端 admin Feature Flags 管理面板 + admin Metrics dashboard /
-Stripe 计费 v2 含 charge.refunded 退款打标 + invoice.paid 月账单 PDF 邮件 /
-配额超限 / Provider 桶满 SSE 实时 toast / ADMIN_EMAILS 落 Settings / DAG 视图 /
-pytest 120 case 全过。
+🎉 v1 工程闭环全部收口：22 Track 合并完毕（10 天工作量浓缩在一天），pytest 130 PASS，
+5 条 alembic 迁移全落库，125+ 路由（含全部业务 + admin + cost + RBAC）。
+当前能力：video_full 端到端 + 全发布闭环 + cost 可观测 + admin 后台 + 配额超限实时
+toast + 月账单自动邮件 + workspace RBAC：配额 v2 tenant + provider 桶 + 按 tenant
+聚合的 model_calls 成本视图（含 provider 横向 bar + 时序折线 dashboard）/
+VoiceAgent v4 word-level / ArtAgent v3+v4+v5（多角色 anchor 按 shot.focus_character
+逐镜选 + canary 按 tenant_id hash 染色 v4↔v3-prompt-only）/ VideoAgent v2 i2v
+多角色 anchor / EditAgent v5 / 发布执行器 v1（dry-run/youtube/bilibili，YouTube
+升级 8 MiB chunked PUT + 进度回写 SSE 不再卡 1080p timeout / Fernet 凭证加密 /
+OAuth）+ publish 异步化（celery + SSE phase 流 + last_event_id 断网续传）/
+DLQ retry 按 task_name 路由 / feature_flags v1 + 后端 admin 路由 + 前端 admin
+Feature Flags 管理面板 + admin Metrics dashboard / Stripe 计费 v2 含 charge.refunded
+退款打标 + invoice.paid 月账单 PDF 邮件 / 配额超限 / Provider 桶满 SSE 实时 toast /
+ADMIN_EMAILS 落 Settings / RBAC v1（workspace member role + 邮箱白名单 fallback）/
+DAG 视图 / pytest 130 case 全过。
 请直接做（除非我另说）：
-(A) T-20 YouTube + Stripe 真账号 e2e（半天，**非代码工作**：用户配 .env 真 key 跑一次完整链路 + 写 E2E_VERIFY_REPORT.md）；
-(B) T-24 真 RBAC（1.5 天，依赖 T-23 已合）；
-(C) T-12 bilibili 自动发布（等 MCN，2-3 天，商务问题）；
-(D) T-19 ArtAgent v6 真 multi-IP（等 SiliconFlow / Replicate 端点，外部依赖）。
-开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 c3d4e5f6a7b8；
-            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 120 PASS；
-            (5) 重启 backend 才会加载第二+三+四+五波 14 条 Track 新代码（pid 30876 仍在 11:13 旧版）；
+(A) T-20 YouTube + Stripe 真账号 e2e（半天，**非代码工作**：配 .env 真 key
+    跑一次完整链路 + 写 E2E_VERIFY_REPORT.md）；
+(B) T-12 bilibili 自动发布（等 MCN，2-3 天，商务问题）；
+(C) T-19 ArtAgent v6 真 multi-IP（等 SiliconFlow / Replicate 端点，外部依赖）；
+(D) 长尾（L-01 字幕翻译 / L-02 卡拉 OK 高亮 / L-06 Celery worker Docker /
+    L-07-09 ADR 文档 / L-12 i18n 完整覆盖 等等）。
+开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 d4e5f6a7b8c9；
+            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 130 PASS；
+            (5) 重启 backend 才会加载第二+三+四+五+六波 15 条 Track 新代码（pid 30876 仍在 11:13 旧版）；
             (6) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
 ```
 

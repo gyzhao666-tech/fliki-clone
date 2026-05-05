@@ -1,16 +1,16 @@
-# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 Track 全部已合并）
+# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 = 22 Track 全部已合并）
 
 > 这份是**给每个 Cursor Agent Window 看的**：进入仓库第一件事 read 这份，找你的 Track，按规则执行。
 > 协调者：人类（用户）；分支合并、SESSION_HANDOFF.md 更新由人类（或最后一个 agent）统一负责。
 
-## 0. 仓库 / 进程现状（2026-05-05 15:50 更新）
+## 0. 仓库 / 进程现状（2026-05-05 16:30 更新 · v1 工程闭环全部收口）
 
 - **GitHub**：https://github.com/gyzhao666-tech/fliki-clone（monorepo：`fliki-clone-api/` + `fliki-clone/`）
 - **本地仓库根**：`/Users/zhaoguangyuan/project/empty/`
-- **基线**：`main` @ `8758721 Merge track-23-admin-emails-settings`（第五波最后一条）
-- **alembic head**：**`c3d4e5f6a7b8`**（含 `model_calls.tenant_id`；第五波没动 schema；已落 DB；不要重复跑）
+- **基线**：`main` @ `a1c8c80 Merge track-24-rbac-workspace-role`（第六波最后一条 / v1 收口）
+- **alembic head**：**`d4e5f6a7b8c9`**（含 `team_members.role`；已落 DB；不要重复跑）
 - **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；
-  **第二+三+四+五波合并后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
+  **v1 全部 22 Track 合并完后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
   ```bash
   kill 30876
   cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
@@ -18,7 +18,7 @@
   ```
   **不要带 `--reload`**（会启 Python 3.12 子进程，import error）
 - **前端进程**：pid `8947`，3000 端口；hot-reload 自动生效不用重启
-- **测试基线**：`cd fliki-clone-api && make test` 应得 **120 passed**；改完代码前后都跑一遍
+- **测试基线**：`cd fliki-clone-api && make test` 应得 **130 passed**；改完代码前后都跑一遍
 - **背景知识必读**：`SESSION_HANDOFF.md`（项目当前能力 / 已知坑 / 配置约束）
 
 ## 0.1 第一波 7 Track 合并状态（2026-05-05 12:35 完成）
@@ -99,6 +99,21 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
 `alembic head` 仍是 `c3d4e5f6a7b8`（本批没人占迁移槽，T-24 留下次）。
 全量 pytest 120 PASS（89 baseline + 10 T-25 + 7 T-22 + 8 T-21 + 6 T-23）。
 
+## 0.6 第六波 1 Track 合并状态（2026-05-05 16:30 完成 · v1 工程闭环收口）
+
+| Track | 状态 | 合并 commit |
+|---|---|---|
+| 24 RBAC v1（workspace member role + 邮箱白名单 fallback；alembic `d4e5f6a7b8c9`）| ✅ | `a1c8c80` |
+
+无合并冲突。alembic 双向迁移测过（upgrade → downgrade -1 → upgrade，列消失再回来不丢数据）。
+全量 pytest 130 PASS（120 baseline + 10 新增 RBAC 三路径 / cache TTL / alembic 列存在 / owner backfill / `_require_admin` 集成）。
+
+> **v1 工程闭环全部收口**：22 个 Track 合并完毕，5 条 alembic 迁移全落库（`7f51c2a48e10` →
+> `9a6e4d127b58` → `c1e8d3b2f0a9` → `a4d72b91e3c5` → `e58c4a1d2b73` → `c2f9b7a04ef1` →
+> `8b1f6c2d4a93` → `9c2d4e5f6a7b` → `a1b2c3d4e5f6` → `b2c3d4e5f6a7` → `c3d4e5f6a7b8` →
+> `d4e5f6a7b8c9`），125+ 路由（含 v1 全部业务 + admin + cost + RBAC）。距离真正上线
+> 只差 **T-20 真账号 e2e**（半天，**非代码**，由协调者自跑）。
+
 ## 1. 通用规则（所有 agent 必须遵守）
 
 1. **每个 Track 一条 feature branch**（已预创建）；进入工作前：
@@ -106,9 +121,9 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
    git checkout track-XX-<your-track>
    ```
 2. **不要切换分支**；不要 rebase / merge main；改完留 commit 在 feature branch 上，由人类合并。
-3. **alembic 互斥锁**：第六波本批中**只有 Track-24** 占用迁移槽（rev `d4e5f6a7b8c9` 顶 `c3d4e5f6a7b8`）。其它 Track 禁止改 schema；需要新字段优先用 `meta_json` / `outputs_json` 等已有 JSON 列承载。
-4. **`.env` 互斥锁**：第六波本批不需要改 `.env` / `app/config.py`（`admin_emails` / SMTP_* / STRIPE_* / ADMIN_EMAILS 都已就绪）。
-5. **`pipeline/page.tsx` 大文件分段**：T-24 不动此文件。每个 Track 卡片必须明确指定动哪个子组件 / hook，不要越界。
+3. **alembic 互斥锁**：v1 工程闭环已收口；新 Track 加列时各自约定 rev id（顶 `d4e5f6a7b8c9`），多 Track 同时加 schema 需协调者串行合并。
+4. **`.env` 互斥锁**：先看 `app/config.py` 是否已有所需字段；新增 settings 字段单独留一个 Track 处理，不要在普通业务 Track 里夹带。
+5. **`pipeline/page.tsx` 大文件分段**：每个 Track 卡片必须明确指定动哪个子组件 / hook，不要越界。
 6. **commit 完整性 ★ T-14 教训**：完成代码后**必须** `git status` 确认 working tree clean 才算交付（第三波 T-14 写完代码忘 commit + NOTES，让协调者收口）。
 7. **commit message 风格**：参考 baseline；中英混合 OK；要写**为什么**（why）而非只列 what。
 8. **完成后写一份 `TRACK_<ID>_NOTES.md` 在仓库根**：包含：
@@ -423,17 +438,9 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
   - 集成：起 redis → reserve 真超限 → 第二个进程订阅 user channel 应收到事件
 - **不做**：前端 toast 节流 / 去重（v1 简单 toast 即可）；不影响 pipeline / publish_plan 既有 SSE
 
-## 2.8 第六波（**T-24 本地分支已预创建**；T-19 / T-20 仍待外部）
+## 2.8 第六波（已全部 merge，留作历史档案）
 
-### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
-
-- **分支**：`track-19-multi-ip-adapter`（不创建本地分支，标 ⏸）
-- **依赖**：等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
-
-### Track-20 · YouTube + Stripe 真账号 e2e（**协调者自跑，不开 Agent**）★★ (半天)
-
-- 不创建 feature branch（不动代码）
-- 见 SESSION_HANDOFF.md「T-20 协调者自跑指南」段；交付物：`E2E_VERIFY_REPORT.md`（截图 + log + 通过结论）
+> **以下 1 条已合并到 main**（见 0.6 表）。新派发请直接看 2.9 节剩余可派任务。
 
 ### Track-24 · L-05 真 RBAC（workspace member role）★ (1.5 天)
 
@@ -463,23 +470,40 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
   - 集成：seed 一个 user 是 workspace owner → role 自动 backfill 为 admin → `_require_admin` 通过；demo@example.com fallback 不依赖 team_member 仍通过
 - **不做**：editor / viewer 实际权限分级（v1 只识别 admin vs 非 admin；编辑权限分级是 L-05 真做时的事）；workspace 切换 UI（前端用第一个有权限的 workspace 即可）
 
+## 2.9 剩余可派任务（v1 工程闭环已收口；以下都是外部依赖 / 商务问题 / 长尾，可任意时机派）
+
+### Track-19 · ArtAgent v6 多角色 IP-Adapter 真接入 ★ (1-1.5 天) ⏸ 等外部依赖
+
+- 等 SiliconFlow Kolors-IP / Replicate Flux Redux 出 multi-IP 端点；当前 Track-09 已留 `anchors_by_role` 接入点
+
+### Track-20 · YouTube + Stripe 真账号 e2e（**协调者自跑，不开 Agent**）★★ (半天)
+
+- 不创建 feature branch（不动代码）；交付物：`E2E_VERIFY_REPORT.md`（截图 + log + 通过结论）
+- 详细操作清单见 SESSION_HANDOFF.md「T-20 协调者自跑指南」段
+
+### Track-12 · bilibili 自动发布（依赖 MCN 商务入驻）★ (2-3 天)
+
+- 等 MCN OpenAPI；技术骨架已在 `adapters/bilibili.py` 留好
+
 ## 3. 长尾（任意时机）
 
 | ID | 任务 | 工作量 |
 |---|---|---|
 | L-01 | 字幕翻译 + 多语言版本 | 1 天 |
 | L-02 | 卡拉 OK 高亮联动 audio.timeupdate | 半天 |
-| L-03 | metric dashboard（cost / view_count 时序） | 1.5 天 |
-| L-04 | 月账单 PDF 导出 + 邮件（依赖 Track-11 webhook `invoice.paid`） | 1 天 |
-| L-05 | RBAC：workspace member editor/viewer 权限（替换 Track-10 admin 邮箱白名单） | 1.5 天 |
+| ~~L-03~~ → T-21 | ~~metric dashboard 时序~~ → 第五波已 done | ~~1.5 天~~ |
+| ~~L-04~~ → T-22 | ~~月账单 PDF + 邮件~~ → 第五波已 done | ~~1 天~~ |
+| ~~L-05~~ → T-24 | ~~RBAC workspace member~~ → 第六波已 done | ~~1.5 天~~ |
 | L-06 | Celery worker Docker + supervisor | 半天 |
 | L-07 | ADR-003 凭证加密策略 | 0.5 天 |
 | L-08 | ADR-004 多平台发布 SLA | 0.5 天 |
 | L-09 | ADR-005 角色一致性 v3→v4→v5→LoRA 演进 | 0.5 天 |
-| L-10 | 配额超限 SSE 实时推送 | 半天 |
-| ~~L-11~~ → T-18 | ~~model_calls 加 tenant_id~~ → 移到第三波 | 半天 |
+| ~~L-10~~ → T-25 | ~~配额超限 SSE 实时推送~~ → 第五波已 done | ~~半天~~ |
+| ~~L-11~~ → T-18 | ~~model_calls 加 tenant_id~~ → 第四波已 done | ~~半天~~ |
 | L-12 | 前端 i18n 完整覆盖 | 1.5 天 |
-| L-13 | Track-10 `ADMIN_EMAILS` 从 env 直读迁回 `Settings`（Track-01 互斥锁已解除） | 0.5 天 |
+| ~~L-13~~ → T-23 | ~~ADMIN_EMAILS 迁 Settings~~ → 第五波已 done | ~~0.5 天~~ |
+| L-14 | RBAC editor/viewer 实际权限分级（T-24 follow-up）| 1 天 |
+| L-15 | workspace 切换 UI（让 user 显式选 workspace）| 半天 |
 
 ## 4. 给单个 Cursor Agent Window 的标准开工提示词
 
