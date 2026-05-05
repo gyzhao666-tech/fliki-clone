@@ -29,9 +29,12 @@ class Settings(BaseSettings):
     s3_secret_key: str = ""
     s3_endpoint: str = ""
 
-    # Stripe
+    # Stripe（Track-11）
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
+    # free 档不真扣款；保留 price_id 字段方便未来「免费档也走 Checkout 拿 customer」时启用。
+    # 留空时 stripe_client.plan_for_price_id 自动忽略 free 档反查。
+    stripe_price_free: str = ""
     stripe_price_standard: str = ""
     stripe_price_premium: str = ""
 
