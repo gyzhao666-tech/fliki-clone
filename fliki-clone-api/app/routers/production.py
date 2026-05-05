@@ -874,17 +874,34 @@ _PUBLISH_TERMINAL_STATUSES = {"published", "failed", "cancelled"}
 _PUBLISH_TERMINAL_PHASES = {"completed", "system_error"}
 
 
-def _sse_format(event: str, data: dict[str, Any]) -> str:
+def _sse_format(
+    event: str, data: dict[str, Any], *, event_id: str | None = None
+) -> str:
+    """格式化一条 SSE 事件。
+
+    Track-17：可选 `event_id` 写到 `id:` 字段（来自 redis Stream entry id），
+    让浏览器 EventSource 在断网重连时自动带 `Last-Event-ID` 续传。snapshot 是
+    SSE 端点直接生成的全量对齐，不来自 Stream，缺省 `event_id=None`。
+    """
+
+    head = f"id: {event_id}\n" if event_id else ""
     return (
-        f"event: {event}\n"
+        f"{head}event: {event}\n"
         f"data: {_json_mod.dumps(data, ensure_ascii=False, default=str)}\n\n"
     )
 
 
 async def _publish_plan_sse_stream(
-    plan_id: str, request: Request
+    plan_id: str,
+    request: Request,
+    *,
+    last_event_id: str | None = None,
 ) -> AsyncIterator[str]:
-    """打开一个 SSE 流：snapshot → 订阅 redis 事件 → 终态后关闭。"""
+    """打开一个 SSE 流：snapshot → 订阅 redis 事件 → 终态后关闭。
+
+    Track-17：`last_event_id` 来自请求头 `Last-Event-ID`，非空时透传到
+    `subscribe_publish_plan`，让 redis Stream 从断点续推 `publish_plan_state`。
+    """
 
     try:
         plan = _load_plan_or_404(plan_id)
@@ -901,7 +918,9 @@ async def _publish_plan_sse_stream(
     deadline = loop.time() + _PUBLISH_SSE_MAX_DURATION_SEC
     last_hb = loop.time()
     sub_iter = pipeline_events.subscribe_publish_plan(
-        plan_id, stop_event=stop_event
+        plan_id,
+        last_event_id=last_event_id,
+        stop_event=stop_event,
     )
 
     try:
@@ -918,8 +937,8 @@ async def _publish_plan_sse_stream(
                     last_hb = now
                 continue
 
-            event_type, payload = tick_msg
-            yield _sse_format(event_type, payload)
+            event_type, payload, event_id = tick_msg
+            yield _sse_format(event_type, payload, event_id=event_id)
             last_hb = now
 
             # phase=completed/system_error 后给其他事件留 200ms 缓冲再断开
@@ -948,8 +967,12 @@ async def publish_plan_events_stream(
     """SSE 流：实时推 publish_plan_state；snapshot 起手 + heartbeat + 自动关闭。"""
 
     _ensure_publish_plan_owner(plan_id, current_user.id)
+    # Track-17：Last-Event-ID 透传给 subscribe → redis XREAD 从断点续推
+    last_event_id = request.headers.get("Last-Event-ID") or None
     return StreamingResponse(
-        _publish_plan_sse_stream(plan_id, request),
+        _publish_plan_sse_stream(
+            plan_id, request, last_event_id=last_event_id
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache, no-transform",

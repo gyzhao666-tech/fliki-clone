@@ -16,7 +16,12 @@ import { listFilePublishPlans, PublishPlanOut } from "@/lib/production";
  * 让 PlanRow 渲一根进度条；`upload_progress` 不是终态事件（终态仍走
  * `publish_plan_state.phase=completed/system_error`）。
  *
+ * Track-17 扩展：后端走 redis Stream + pub/sub 双写，每条事件带 `id: <stream_id>`；
+ * 浏览器原生 EventSource 自动缓存到 `lastEventId`，断网重连时通过 `Last-Event-ID`
+ * 头续传，后端从该 id 之后继续推流（snapshot 不带 id，永远全量重发）。
+ *
  * 协议（与后端 `app/routers/production.py` + `services/publishing/executor.py` 对齐）：
+ *   - id: <stream_id>                                                Track-17：redis Stream entry id（snapshot 不带）
  *   - event: snapshot              data: <PublishPlanOut>           连接首条；用它对齐全量
  *   - event: publish_plan_state    data: <PublishPlanStateEvent>    单事件
  *       phase ∈ "running" | "completed" | "system_error"
@@ -29,8 +34,12 @@ import { listFilePublishPlans, PublishPlanOut } from "@/lib/production";
  * 行为：
  *   - 启动 = `start(planId, fileId?)`：开 EventSource；fileId 用于 fallback polling
  *   - 终态 phase（completed / system_error）→ 自动关闭；onTerminal 回调
- *   - 连续 2 次 onerror → 退到 2.5s polling fallback（拉 /files/{fileId}/publish-plans
- *     比较本 plan.status；status 进入 published/failed/cancelled 视为终态）
+ *   - **浏览器自动断网重连（Track-17）**：原生 EventSource 收到带 `id:` 的事件后会把
+ *     id 缓存到 `lastEventId`，断网时进入 CONNECTING 状态自动重连，并把 `lastEventId`
+ *     通过 `Last-Event-ID` 头送回服务端；后端从 redis Stream 该 id 之后续推，不丢事件。
+ *   - 仅当 readyState 进入 CLOSED（server 拒绝 / 4xx / CORS 等不可恢复）才计失败次数；
+ *     连续 2 次后退到 2.5s polling fallback（拉 /files/{fileId}/publish-plans 比较 plan.status）；
+ *     status 进入 published/failed/cancelled 视为终态
  *   - 不传 fileId 时 polling 退化为 noop（终态判断只能靠 SSE 事件）
  *   - planId 变化 / unmount → 自动 cleanup
  *
@@ -282,7 +291,13 @@ export function usePublishPlanStream(
     });
 
     es.addEventListener("error", () => {
-      // SSE 重连机制不可靠（鉴权过期 / 后端重启 / redis 抖动）；自己计数 fallback
+      // Track-17：先看 readyState，让浏览器原生重连（带 Last-Event-ID）有机会续传。
+      // - CONNECTING (0)：浏览器在自动重连，redis Stream 从 lastEventId 后续推 → 不计失败
+      // - CLOSED   (2)：服务端拒绝 / 鉴权失败 / CORS 等不可恢复 → 计失败 → 达阈值 fallback polling
+      const state = session.es?.readyState ?? EventSource.CLOSED;
+      if (state !== EventSource.CLOSED) {
+        return;
+      }
       session.consecutiveErrors += 1;
       if (session.consecutiveErrors >= FALLBACK_AFTER_FAILURES) {
         if (session.es) {
