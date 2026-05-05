@@ -73,3 +73,49 @@ export function getRecentCostCalls(args?: { tenantId?: string; limit?: number })
   const qs = buildQuery({ tenant_id: args?.tenantId, limit: args?.limit });
   return api<RecentCallsOut>(`/cost/recent${qs}`);
 }
+
+// ── Track-21 · /timeseries（admin metrics 折线图数据源）───────────────────
+//
+// 后端 GET /api/cost/timeseries?tenant_id=&provider=&period=daily|weekly&days=30
+// 返按 (bucket, provider) 聚合的 cost / call_count；admin metrics 页直接消费。
+//
+// 复用与 getCostSummary / getRecentCostCalls 相同的 _resolve_query_tenant
+// 鉴权语义：admin 邮箱可指定他人 tenant_id；非 admin 静默被覆盖回自己。
+//
+// `provider` 为单值过滤；不传 → 返全部 provider 的多 series 数据。
+
+export type CostTimeseriesPeriod = "daily" | "weekly";
+
+export interface CostTimeseriesPoint {
+  date: string;
+  provider: string;
+  cost_usd: number;
+  call_count: number;
+}
+
+export interface CostTimeseries {
+  tenant_id: string;
+  period: CostTimeseriesPeriod;
+  days: number;
+  provider_filter: string | null;
+  period_start: string;
+  period_end: string;
+  total_cost_usd: number;
+  total_calls: number;
+  items: CostTimeseriesPoint[];
+}
+
+export function getCostTimeseries(args?: {
+  tenantId?: string;
+  provider?: string;
+  period?: CostTimeseriesPeriod;
+  days?: number;
+}) {
+  const qs = buildQuery({
+    tenant_id: args?.tenantId,
+    provider: args?.provider,
+    period: args?.period,
+    days: args?.days,
+  });
+  return api<CostTimeseries>(`/cost/timeseries${qs}`);
+}
