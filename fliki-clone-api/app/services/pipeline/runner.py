@@ -21,6 +21,7 @@ from app.models.pipeline import PipelineRun, PipelineStep  # noqa: F401  保证�
 
 from . import dlq as pipeline_dlq
 from . import events as pipeline_events
+from . import feature_flags as pipeline_feature_flags
 from . import persist as pipeline_persist
 from .types import (
     PipelineContext,
@@ -196,6 +197,13 @@ def execute_step(step_id: str) -> StepResult:
     inputs = step_row.get("inputs") or _load_run_inputs(step_row["run_id"])
     run_user_id = _load_run_user(step_row["run_id"])
     run_tenant = _load_run_tenant(step_row["run_id"])
+    # Track-10 灰度：一次性 load 该 tenant 全部 flag 入 ctx，避免 agent 反复击 DB
+    tenant_id_for_flags = run_tenant.get("tenant_id")
+    feature_flags_map: dict[str, dict[str, Any]] = (
+        pipeline_feature_flags.load_for_tenant(tenant_id_for_flags)
+        if tenant_id_for_flags
+        else {}
+    )
     ctx = PipelineContext(
         run_id=step_row["run_id"],
         step_id=step_id,
@@ -203,8 +211,9 @@ def execute_step(step_id: str) -> StepResult:
         file_id=_load_run_file(step_row["run_id"]),
         inputs=inputs,
         upstream_outputs=upstream_outputs,
-        tenant_id=run_tenant.get("tenant_id"),
+        tenant_id=tenant_id_for_flags,
         tenant_plan=run_tenant.get("plan") or "free",
+        feature_flags=feature_flags_map,
     )
 
     _mark_step_running(step_id)

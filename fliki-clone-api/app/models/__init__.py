@@ -26,6 +26,7 @@ from app.models.production import (
 from app.models.quota import ModelQuota
 from app.models.tenant_quota import ProviderConcurrencyBucket, TenantQuota
 from app.models.platform_credential import PlatformCredential
+from app.models.feature_flag import FeatureFlag
 
 __all__ = [
     "User",
@@ -48,6 +49,8 @@ __all__ = [
     "ProviderConcurrencyBucket",
     # 发布执行器 v1（平台 OAuth 凭证）
     "PlatformCredential",
+    # 灰度发布 / canary（Track-10）
+    "FeatureFlag",
     "PipelineRun",
     "PipelineStep",
     "DeadLetterTask",

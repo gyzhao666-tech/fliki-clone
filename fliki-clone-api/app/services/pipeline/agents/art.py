@@ -96,6 +96,7 @@ from app.services.model_gateway import (
     get_gateway,
 )
 
+from .. import feature_flags as pipeline_feature_flags
 from ..types import PipelineContext, Step, StepResult, StepStatus, register_agent
 
 logger = logging.getLogger(__name__)
@@ -323,6 +324,24 @@ class ArtAgent(Step):
             for name, a in character_anchors.items()
             if isinstance(a.get("url"), str) and a["url"]
         }
+        # ── Track-10 灰度（与 v5 多角色叠加）：通过 art_ipadapter_pct flag 决定本 run 是否启用 v4 IP-Adapter ──
+        # value 形态：{"pct": 0..100} / {"enabled": bool} / {"variant": "v4"/"v3"}。
+        # is_enabled 命中 → anchors_url_by_role 原样喂给 _generate_keyframes（v4/v5 IP-Adapter）；
+        # 不命中 → 清空 anchors_url_by_role，所有镜降到 prompt-only（character_anchor 前缀注入仍生效）；
+        # flag 缺省 → 默认走 v4/v5（向后兼容）；key=ctx.run_id 让同 tenant 不同 run 间按 pct 分流。
+        canary_value = (ctx.feature_flags or {}).get("art_ipadapter_pct")
+        if canary_value is None:
+            canary_v4 = True
+        else:
+            canary_v4 = pipeline_feature_flags.is_enabled(
+                ctx.tenant_id or "",
+                "art_ipadapter_pct",
+                key=ctx.run_id,
+                flags=ctx.feature_flags,
+            )
+        canary_variant = "v4" if canary_v4 else "v3-prompt-only"
+        if not canary_v4:
+            anchors_url_by_role = {}
         if not skip_keyframes:
             enriched_shots, kf_cost, keyframe_failures = _generate_keyframes(
                 enriched_shots,
@@ -352,6 +371,9 @@ class ArtAgent(Step):
             "protagonist_name": protagonist.get("name") if protagonist else None,
             # v5 新字段：所有锁定角色的 anchor 字典（含主角）
             "character_anchors": character_anchors or None,
+            # Track-10 灰度可观测：让前端 / 调试能知道本 run 实际走了哪一档
+            "canary_variant": canary_variant,
+            "canary_flag_value": canary_value,
         }
         if anchor_warning:
             outputs["consistency_warning"] = anchor_warning
