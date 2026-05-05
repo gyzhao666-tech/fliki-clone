@@ -2287,6 +2287,12 @@ function ShotsSourceBadge({ useShotList }: { useShotList: boolean }) {
 // ── VideoArtifact ───────────────────────────────────────────────────────────
 //   video step 卡片：每镜显示 <video> 缩略图 + provider/model/cost/error。
 //   优先读 shot_list（含 video_url + 同行的 keyframe_url 做 poster）；缺失退到 outputs_json。
+//   v2：每镜右上角额外渲染 <RefImageSourceBadge>：emerald「anchor 锚定」/ sky「keyframe」/
+//   muted「无参考」。ref_image_source 字段只活在 video step.outputs_json.shots[i] 里
+//   （shot_lists 表暂不存这个字段，避免新加 alembic 迁移），所以即使主体走 shot-list 路径，
+//   徽标仍会按 index 从 outputsShots 里 lookup；找不到时按 keyframe_url 推断（best-effort）。
+
+type RefImageSource = "anchor" | "keyframe" | "none";
 
 function VideoArtifact({
   step,
@@ -2299,13 +2305,27 @@ function VideoArtifact({
 }) {
   // 优先用 shot-list（含 art keyframe + video URL 同行）；缺失 fallback 到 outputs_json
   const useShotListSource = !!(shotList && shotList.shots && shotList.shots.length);
+
+  // 按 index 建 outputs lookup，给徽标读 ref_image_source 用（shot_list 路径下 schema 不带）
+  const outputsByIndex = new Map<number, Record<string, unknown>>();
+  outputsShots.forEach((s, i) => {
+    const idx =
+      typeof s.index === "number" ? (s.index as number) : i + 1;
+    outputsByIndex.set(idx, s);
+  });
+
   const rows: Array<VideoShotView> = useShotListSource
-    ? shotList!.shots.map(toViewFromShotList)
+    ? shotList!.shots.map((s) =>
+        toViewFromShotList(s, outputsByIndex.get(s.index)),
+      )
     : outputsShots.map(toViewFromOutputs);
 
   const okCount = rows.filter((r) => r.video_url).length;
   const errCount = rows.filter((r) => r.error).length;
   const totalCost = rows.reduce((acc, r) => acc + (r.cost_usd || 0), 0);
+  const anchorCount = rows.filter((r) => r.ref_image_source === "anchor").length;
+  const keyframeCount = rows.filter((r) => r.ref_image_source === "keyframe").length;
+  const noRefCount = rows.filter((r) => r.ref_image_source === "none").length;
 
   if (!rows.length) {
     return (
@@ -2324,13 +2344,28 @@ function VideoArtifact({
           {errCount ? ` · ${errCount} 失败` : ""}
           {totalCost > 0 ? ` · cost $${totalCost.toFixed(4)}` : ""}
         </span>
+        {anchorCount + keyframeCount + noRefCount > 0 ? (
+          <span
+            className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+            title="ref-image 来源汇总：anchor=主角镜用全片锚点参考板，keyframe=每镜独立关键帧，none=无 ref（GENERATE_VIDEO 降级）"
+          >
+            ref:{" "}
+            <span className="text-emerald-500">{anchorCount} anchor</span>
+            {" · "}
+            <span className="text-sky-500">{keyframeCount} keyframe</span>
+            {noRefCount ? ` · ${noRefCount} none` : ""}
+          </span>
+        ) : null}
       </div>
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4">
         {rows.slice(0, 12).map((r) => (
           <div
             key={r.index}
-            className="flex flex-col gap-1 rounded border border-border bg-muted/20 p-1.5"
+            className="relative flex flex-col gap-1 rounded border border-border bg-muted/20 p-1.5"
           >
+            <div className="absolute right-1 top-1 z-10">
+              <RefImageSourceBadge source={r.ref_image_source} />
+            </div>
             {r.video_url ? (
               <video
                 src={r.video_url}
@@ -2388,6 +2423,42 @@ function VideoArtifact({
   );
 }
 
+// ── ref-image 来源徽标（v2 Track-05）─────────────────────────────────────────
+//   anchor   → emerald「anchor 锚定」（主角镜复用全片锚点参考板，跨镜更稳定）
+//   keyframe → sky「keyframe」（每镜独立关键帧；非主角镜 / character_locked=False）
+//   none     → muted「无参考」（GENERATE_VIDEO 降级路径）
+
+function RefImageSourceBadge({ source }: { source: RefImageSource }) {
+  if (source === "anchor") {
+    return (
+      <span
+        className="rounded bg-emerald-500/85 px-1 py-0.5 text-[9px] font-medium text-emerald-50 shadow-sm"
+        title="ref-image 来源：character_anchor（ArtAgent v3 主角锚点参考板，跨镜复用）"
+      >
+        anchor 锚定
+      </span>
+    );
+  }
+  if (source === "keyframe") {
+    return (
+      <span
+        className="rounded bg-sky-500/85 px-1 py-0.5 text-[9px] font-medium text-sky-50 shadow-sm"
+        title="ref-image 来源：本镜独立 keyframe（非主角镜或 character_locked=false）"
+      >
+        keyframe
+      </span>
+    );
+  }
+  return (
+    <span
+      className="rounded bg-muted px-1 py-0.5 text-[9px] font-medium text-muted-foreground shadow-sm"
+      title="无 ref-image：降级到 GENERATE_VIDEO（无角色一致性引导）"
+    >
+      无参考
+    </span>
+  );
+}
+
 interface VideoShotView {
   index: number;
   video_url: string | null;
@@ -2397,9 +2468,29 @@ interface VideoShotView {
   cost_usd: number;
   duration_ms: number;
   error: string | null;
+  ref_image_source: RefImageSource;
 }
 
-function toViewFromShotList(s: ShotOut): VideoShotView {
+function readRefImageSource(
+  raw: Record<string, unknown> | undefined,
+  fallback: { keyframe_url: string | null },
+): RefImageSource {
+  const v =
+    raw && typeof raw.ref_image_source === "string"
+      ? (raw.ref_image_source as string)
+      : null;
+  if (v === "anchor" || v === "keyframe" || v === "none") {
+    return v;
+  }
+  // outputs_json 还没写 ref_image_source（旧 run / persist 还没触发）→ 按 keyframe 推断
+  // 注：这里推断不到 anchor，只能区分 keyframe / none；准确值由后端写入
+  return fallback.keyframe_url ? "keyframe" : "none";
+}
+
+function toViewFromShotList(
+  s: ShotOut,
+  outputsRow: Record<string, unknown> | undefined,
+): VideoShotView {
   return {
     index: s.index,
     video_url: s.video_url,
@@ -2409,15 +2500,19 @@ function toViewFromShotList(s: ShotOut): VideoShotView {
     cost_usd: s.video_cost_usd,
     duration_ms: s.video_duration_ms,
     error: s.video_error,
+    ref_image_source: readRefImageSource(outputsRow, {
+      keyframe_url: s.keyframe_url,
+    }),
   };
 }
 
 function toViewFromOutputs(s: Record<string, unknown>, i: number): VideoShotView {
+  const keyframe_url =
+    typeof s.keyframe_url === "string" ? (s.keyframe_url as string) : null;
   return {
     index: typeof s.index === "number" ? (s.index as number) : i + 1,
     video_url: typeof s.video_url === "string" ? (s.video_url as string) : null,
-    keyframe_url:
-      typeof s.keyframe_url === "string" ? (s.keyframe_url as string) : null,
+    keyframe_url,
     // outputs_json 用 provider/model/mode（而不是 video_provider）
     provider: typeof s.provider === "string" ? (s.provider as string) : null,
     mode: typeof s.mode === "string" ? (s.mode as string) : null,
@@ -2425,6 +2520,7 @@ function toViewFromOutputs(s: Record<string, unknown>, i: number): VideoShotView
     duration_ms:
       typeof s.duration_ms === "number" ? (s.duration_ms as number) : 0,
     error: typeof s.error === "string" ? (s.error as string) : null,
+    ref_image_source: readRefImageSource(s, { keyframe_url }),
   };
 }
 
