@@ -1,7 +1,33 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：v1 工程闭环全部收口 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 = 22 Track 全合）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：v1 工程闭环全部收口 → 多 Agent 第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 + 第七波 5 = 27 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 17:35 更新：**多 Agent 第七波 5 Track 已合并到 main**（`pytest 146/146 PASS`）。
+> 合并顺序：T-29 → T-28 → T-26 → T-30 → T-27（T-27 与 T-26 在 `pipeline/page.tsx`
+> 顶部 import 段相邻冲突，手解保留双方）。alembic head 仍是 **`d4e5f6a7b8c9`**（本批没人占迁移槽）。
+>
+> **协调者前置修复**：`Makefile::test` target 之前用 PATH 上的系统 framework pytest
+> （`/Library/Frameworks/.../bin/pytest`，缺 `pytest-asyncio` 插件让 55 个 async case
+> 误判 sync 失败 → `make test` 长期显示 75 PASS / 55 FAIL）；改成显式
+> `.venv/bin/python -m pytest` 后 **130/130 PASS 才是真基线**（`292f4ff`）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 26 卡拉 OK 字幕高亮 | 新 hook `use-audio-current-word.ts`：throttle ≤ 33ms (~30fps) + 二分查找当前 (subtitleIndex, wordIndex)；纯函数 `findCurrentWord` 单独可测；audio onPlay/onPause/onEnded 控制 enabled，避免 paused 时持续 register listener；`pipeline/page.tsx` 把 voice 段抽成独立 `VoiceArtifact` 组件（hooks 不能在条件分支调）；当前字幕条 sky-500/15 + ring-1 + transition 150ms / 当前 word `border-violet-500 bg-violet-500 text-white`；顶部「卡拉 OK 实时高亮 ✓」徽标（仅 `subtitle_granularity === "word"` 显示）；word-level 场景 `<details>` 默认展开；14 case 单测（node:test + jiti loader 跑 ts；jiti 已是 next.js 子依赖零新 dep）|
+> | 27 RBAC editor/viewer 写权限分级 | `services/auth/rbac.py` 末尾追加 `is_editor` / `is_viewer` / `require_role(allowed)` factory（不动 T-24 既有 `is_admin` / `get_user_role` 签名）；admin 走邮箱白名单 fallback 仍命中，editor/viewer **不**走 fallback 严格 team_members（防止运营误把 admin 邮箱当编辑权限）；14 个写端点挂 `dependencies=[Depends(require_role(["admin","editor"]))]`：production 7（POST/PATCH/DELETE publish-plans + execute + 3 versions）+ pipelines 5（start / cancel / tick / rerun / approve）+ billing 2（checkout-session / portal-session 仅 admin）；不入侵函数签名；`admin_flags.py::/me` 端点 schema 扩 `role` / `is_editor` / `is_viewer` 三字段；前端 `lib/admin-flags.ts::AdminMeOut` 同步扩；新 `lib/role.ts::canWrite/disabledReason` + `hooks/use-current-role.ts`；`pipeline/page.tsx` 顶部「启动」+ ProductionPanel 各按钮 + PlanRow execute + `app/billing/page.tsx::UpgradeButton` 按 role 灰化 + 中文 tooltip "需要 admin/editor 权限"；10 case 单测覆盖 is_editor/is_viewer/require_role 三路径 + 邮箱 fallback 仅 admin / 不到 editor + 写端点 mock current_user role 的 200/403 |
+> | 28 Celery worker Docker | `fliki-clone-api/Dockerfile`（python:3.10-slim + apt ffmpeg/libpq/curl/gcc，CMD uvicorn 不带 --reload）+ `fliki-clone/Dockerfile`（node:20-alpine multi-stage builder→runner）+ `docker-compose.yml`（5 服务：postgres + redis + backend + worker(celery -A app.services.pipeline.celery_app worker -Q interactive,media,default --concurrency=2) + frontend；全配 healthcheck + service_healthy 等待；env_file 透传 fliki-clone-api/.env，compose 仅覆盖 DATABASE_URL_SYNC/REDIS_URL/CELERY_*/CELERY_ENABLED 走容器网络）+ .dockerignore × 3（仓库根 + 两 build context）+ `Makefile` 末尾追加 docker-up/down/logs/rebuild target（不动既有 test/pipeline-worker）+ `docs/deployment.md`（241 行单机部署指南：架构图 + 起步 + alembic + 验证 + 6 段排错 + follow-up）；**零业务代码改动**；yaml 用 `python -c "import yaml; yaml.safe_load(...)"` + 字段结构深度验证全 OK；本机无 docker compose v2 留协调者真机 `docker compose config / build` 验证 |
+> | 29 ADR 003+004+005 | **3 个新 ADR 共 561 行纯文档零代码**：003 凭证加密 135 行（单 Fernet KEY 由 `PUBLISH_CREDENTIAL_FERNET_KEY` env 注入；缺失静默降级 plain text + 模块级 warning；rotation 升级 `cryptography.fernet.MultiFernet` 多 KEY 兼容；alternatives：KMS 太重 / AES-GCM reinvent / 不加密 v0 状态）；004 多平台发布 SLA 233 行（每平台 decision 矩阵：dry-run 100% / youtube 8 MiB chunked PUT + 单片 5xx/408/429 指数退避 1s/2s/4s × 3 + 4xx 立即抛 / bilibili stub；失败二元化 业务级→plan.failed / 系统级→DLQ；DLQ retry 按 `task_name` 路由 publish.execute_plan→`execute_publish_plan_task`；`confirm_real_publish` 安全闸门；OAuth refresh_token 长期有效 access_token 1h 过期自动 refresh）；005 角色一致性演进 193 行（v3 prompt-only ★★☆☆☆ → v4 单角色 IP-Adapter ★★★★☆ → v5 多角色 anchor + canary ★★★★★ **当前商业可用基线** → v6 真 multi-IP 等 SiliconFlow Kolors-IP / Replicate Flux Redux 端点 → 远期 LoRA 训练每角色权重存 `character_cards.lora_weight_url`）|
+> | 30 workspace 切换 UI + 后端路由 | 后端 `routers/team.py` 末尾追加 `GET /api/team/workspaces/me`（不动既有 4 端点）+ inline `WorkspaceMembershipOut(id,name,role,is_owner,created_at)` / `WorkspacesListOut` schema；实现：`team_members JOIN workspaces` 拉所有 user 在的 workspace + role；UNION 自己 own 的（不在 team_members 里）兜底 role=admin（与 T-24 backfill 一致）；排序 `created_at ASC` 让前端默认选最早 own 的；owner 同时在 team_members 里时 team_members.role 优先；前端新 `lib/workspaces.ts` + `hooks/use-current-workspace.ts`（Context Provider + localStorage key `fliki:current-workspace-id` 持久化 + 首次默认列表第一个）+ `components/app-shell/workspace-selector.tsx`（shadcn DropdownMenu，admin 紫 / editor sky / viewer slate role badge）；`(app)/layout.tsx` 最外层 wrap `<WorkspaceProvider>`（**包在** UserEventsListener 之外让 sidebar / 子页面都能用）；`sidebar.tsx` logo 段下方（行 100-106 之间）插入 selector div（**不动** admin links 段让 T-27 安全）；6 case 集成测覆盖 owner-only fallback / owner+member / role 来自 team_members 不是 owner / empty user / 401 / pending status |
+>
+> **整体能力扩展**：v1 收口后第一波长尾闭合 ——
+> (1) **卡拉 OK 字幕**：VoiceAgent v4 写出的 word-level 数据真活起来，前端 audio.timeupdate 二分查找 + 当前 word violet 高亮，体验闭环；
+> (2) **RBAC 真三档**：从「邮箱白名单 admin vs 非 admin」二元判定升级为 admin/editor/viewer 真权限分级；admin 全权 + 邮箱 fallback / editor 写不能管计费 / viewer 仅读；14 个后端写端点 + 5 个前端按钮真灰化；
+> (3) **workspace 显式切换**：user 在多个 workspace 时不再卡死在第一个 own 的；sidebar 顶部 dropdown + role badge + localStorage 持久化；
+> (4) **单机 docker 部署**：一键 `docker compose up -d` 起 5 服务（postgres + redis + backend + worker + frontend），healthcheck 链路 + 完整部署文档；
+> (5) **ADR 三连冻结决策**：凭证加密 / 多平台发布 SLA / 角色一致性演进路线图，给后续 v6 / LoRA / k8s helm chart / TikTok adapter 留 reference。
+>
+> 距离 prod 上线**仅剩 3 个外部 / 商务依赖**：T-20 真账号 e2e（半天，非代码，配真 .env key 跑一次）/ T-12 bilibili（等 MCN 商务）/ T-19 真 multi-IP（等 SiliconFlow / Replicate 端点）。
 
 > 2026-05-05 16:30 更新：**Track-24 RBAC v1 已合并到 main**（`pytest 130/130 PASS`）。
 > 第六波 1 Track（T-24）；alembic head 升到 **`d4e5f6a7b8c9`**（顶 `c3d4e5f6a7b8`，

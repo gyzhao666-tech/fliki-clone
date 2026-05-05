@@ -1,25 +1,29 @@
-# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 = 22 Track 全部已合并）
+# 多 Agent 并行 Backlog（2026-05-05 起；第一波 7 + 第二波 4 + 第三波 5 + 第四波 1 + 第五波 4 + 第六波 1 + 第七波 5 = 27 Track 全部已合并）
 
 > 这份是**给每个 Cursor Agent Window 看的**：进入仓库第一件事 read 这份，找你的 Track，按规则执行。
 > 协调者：人类（用户）；分支合并、SESSION_HANDOFF.md 更新由人类（或最后一个 agent）统一负责。
 
-## 0. 仓库 / 进程现状（2026-05-05 16:30 更新 · v1 工程闭环全部收口）
+## 0. 仓库 / 进程现状（2026-05-05 17:35 更新 · 第七波合并完成 · 27 Track 全合）
 
 - **GitHub**：https://github.com/gyzhao666-tech/fliki-clone（monorepo：`fliki-clone-api/` + `fliki-clone/`）
 - **本地仓库根**：`/Users/zhaoguangyuan/project/empty/`
-- **基线**：`main` @ `a1c8c80 Merge track-24-rbac-workspace-role`（第六波最后一条 / v1 收口）
-- **alembic head**：**`d4e5f6a7b8c9`**（含 `team_members.role`；已落 DB；不要重复跑）
+- **基线**：`main` @ `be6616b Merge track-27-rbac-editor-viewer`（第七波最后一条；下方还会有 coordinator 收口 commit）
+- **alembic head**：**`d4e5f6a7b8c9`**（含 `team_members.role`；本批 0 新迁移；已落 DB；不要重复跑）
 - **后端进程**：pid `30876`，监听 `127.0.0.1:8000`（无 proxy 污染）；
-  **v1 全部 22 Track 合并完后这个 pid 还没重启 → 必须 kill + 重启才会加载新代码**：
+  **5 + 22 = 27 Track 全合后这个 pid 仍是 12:40 旧版 → 必须 kill + 重启才能加载第二+三+四+五+六+七波 20 条 Track 新代码**：
   ```bash
   kill 30876
   cd /Users/zhaoguangyuan/project/empty/fliki-clone-api && \
     .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
   ```
   **不要带 `--reload`**（会启 Python 3.12 子进程，import error）
-- **前端进程**：pid `8947`，3000 端口；hot-reload 自动生效不用重启
-- **测试基线**：`cd fliki-clone-api && make test` 应得 **130 passed**；改完代码前后都跑一遍
+- **前端进程**：pid `5202`（next dev），3000 端口；hot-reload 自动生效不用重启
+- **测试基线**：`cd fliki-clone-api && make test` 应得 **146 passed**（130 + T-30 6 + T-27 10）；改完代码前后都跑一遍
 - **背景知识必读**：`SESSION_HANDOFF.md`（项目当前能力 / 已知坑 / 配置约束）
+
+> **v1 收口后第一波长尾闭合**：T-26 卡拉 OK / T-27 RBAC editor-viewer / T-28 Celery
+> Docker / T-29 ADR 三连 / T-30 workspace 切换 UI 全部合并；剩余仍是 3 个外部 / 商务依赖
+> （T-20 真账号 e2e 半天非代码 / T-12 bilibili 等 MCN / T-19 真 multi-IP 等 SiliconFlow）。
 
 ## 0.1 第一波 7 Track 合并状态（2026-05-05 12:35 完成）
 
@@ -113,6 +117,34 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
 > `8b1f6c2d4a93` → `9c2d4e5f6a7b` → `a1b2c3d4e5f6` → `b2c3d4e5f6a7` → `c3d4e5f6a7b8` →
 > `d4e5f6a7b8c9`），125+ 路由（含 v1 全部业务 + admin + cost + RBAC）。距离真正上线
 > 只差 **T-20 真账号 e2e**（半天，**非代码**，由协调者自跑）。
+
+## 0.7 第七波 5 Track 合并状态（2026-05-05 17:35 完成 · v1 收口后第一波长尾闭合）
+
+合并顺序：T-29 → T-28 → T-26 → T-30 → T-27（T-27 与 T-26 在 `pipeline/page.tsx`
+顶部 import 段相邻冲突，手解保留双方）。
+
+| Track | 状态 | 合并 commit |
+|---|---|---|
+| 26 卡拉 OK 字幕高亮（前端 hook + VoiceArtifact 抽组件 + 14 单测）| ✅ | `506ce15` |
+| 27 RBAC editor/viewer 写权限分级（rbac.py 加 is_editor/is_viewer/require_role + 14 写端点 + 前端 disable + 10 单测）| ✅ | `be6616b` |
+| 28 Celery worker Docker（Dockerfile×2 + docker-compose + .dockerignore×3 + Makefile docker-* + docs/deployment.md）| ✅ | `f609603` |
+| 29 ADR 003+004+005（凭证 / SLA / 一致性演进 561 行）| ✅ | `32f107d` |
+| 30 workspace 切换 UI + 后端 GET /api/team/workspaces/me + 6 单测 | ✅ | `db17a58` |
+
+`alembic head` 仍是 `d4e5f6a7b8c9`（本批没人占迁移槽）。
+全量 pytest **146 PASS**（130 baseline + 6 T-30 + 10 T-27）。
+
+> **协调者前置修复**：本批开工前发现 `make test` 长期显示 75 PASS / 55 FAIL，
+> 根因是 Makefile 用 PATH 上的 framework pytest（缺 `pytest-asyncio` 让 async case
+> 误判 sync 失败）。改成 `.venv/bin/python -m pytest` 后 **130 PASS** 是真基线，
+> 才让本波 5 agent 能信任 baseline 跑测试（详见 commit `292f4ff`）。
+
+> **多 agent 共享 worktree 的副作用**：5 agent 在同一物理仓库切分支 + 写文件 + commit，
+> 出现两次「commit 落错分支」需要 cherry-pick 搬回（T-29 / T-26 都遇到了，最终都
+> 修正到正确 branch）；T-30 用 `/tmp` 备份 + 选择性 stash 隔离自己的 8 个文件不
+> 污染其它 agent。下次派多 Agent 时建议：(1) 用 `git worktree add ../tx-XX <branch>`
+> 给每个 agent 物理隔离的 worktree；(2) 或派少量 agent 串行减少切分支次数；
+> (3) commit 必走显式 `git add <file>` 不要走 `git add -A`。
 
 ## 1. 通用规则（所有 agent 必须遵守）
 
@@ -487,7 +519,15 @@ T-22 在 stripe_price_* 之后加 SMTP_* + INVOICE_EMAIL_ENABLED 一段；T-23 �
 
 - 等 MCN OpenAPI；技术骨架已在 `adapters/bilibili.py` 留好
 
-## 2.9.1 第七波 5 Track 派发（2026-05-05 16:40 创建 · v1 收口后第一波长尾并行）
+## 2.9.1 第七波 5 Track（已全部 merge，留作历史档案）
+
+> **以下 5 条均已合并到 main**（见 0.7 表）。新派发请回到 §2.9 看剩余 3 条等外部依赖的任务，
+> 或从 §3 长尾重新挑（L-12 i18n 仍未做 / L-15 已完成 / L-14 已完成 / L-06 已完成 / L-02 已完成
+> / L-07-09 ADR 已完成）。
+>
+> 历史 spec（保留作 reference，下次类似 Track 派发时复用 互斥锁矩阵 / 文件分区 pattern）：
+>
+
 
 > **协调者注**：先修了 `Makefile::test` target（`pytest` → `.venv/bin/python -m pytest`），
 > 让 `make test` 真能 130 PASS（之前走系统 framework pytest 缺 `pytest-asyncio` 插件，
