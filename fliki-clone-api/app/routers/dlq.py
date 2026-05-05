@@ -5,8 +5,12 @@ DLQ 项是从 `pipeline_runs.user_id` 反推填的，所以 user 只能看 / 操
 
 重投策略：
 - 不在 service 层硬编码调度——根据 `task_name` 在路由层显式分发：
-  - `pipeline.tick` / `background.tick` → `_schedule_tick(run_id, ...)`（沿用 pipelines.py 路径）
-  - `pipeline.execute_step` → 直接 `tick_task.delay(run_id)`（同效果：tick 会重新 claim 那个 step）
+  - `publish.execute_plan` → `execute_publish_plan_task` / `_publish_execute_with_events`
+    （Track-15：publish 死信原本被错误路由到 tick_task，根本不会真重发布；
+    这条独立 task 没有 run_id，args 是 `[plan_id]` + kwargs `{"user_id": ...}`，
+    必须直接派 publish task）
+  - `pipeline.tick` / `pipeline.execute_step` / `background.tick` →
+    `tick_task.delay(run_id)`（tick 会重新 claim ready step，等价于 _schedule_tick）
 - 重投后 DLQ 项标 `retried`；如果再次失败会**新增一行**（不复用旧行）便于审计
 """
 from __future__ import annotations
@@ -101,16 +105,13 @@ async def retry_dlq(
             detail=f"only pending items can be retried (current: {item['status']})",
         )
 
-    run_id = item.get("run_id")
-    if not run_id:
-        raise HTTPException(
-            status_code=400,
-            detail="dlq item has no run_id; cannot dispatch via tick",
-        )
-
-    dispatcher = _retry_dispatch(run_id, background_tasks)
+    dispatcher = _retry_dispatch(item, background_tasks)
     pipeline_dlq.mark(dlq_id, new_status="retried", notes=f"retried via {dispatcher}")
-    return RetryResult(id=dlq_id, dispatcher=dispatcher, notes="re-queued via tick")
+    return RetryResult(
+        id=dlq_id,
+        dispatcher=dispatcher,
+        notes=f"re-queued ({item.get('task_name') or 'unknown'})",
+    )
 
 
 @router.post("/{dlq_id}/discard", response_model=DLQItemOut)
@@ -136,10 +137,65 @@ async def discard_dlq(
     return _to_out(refreshed)
 
 
-def _retry_dispatch(run_id: str, background_tasks: BackgroundTasks) -> str:
-    """与 pipelines.py::_schedule_tick 等效；不直接 import 避免循环依赖。"""
+def _retry_dispatch(dead: dict[str, Any], background_tasks: BackgroundTasks) -> str:
+    """根据 ``dead.task_name`` 派发到正确的 task；返回 dispatcher 名（celery / background）。
 
-    if get_settings().celery_enabled:
+    Track-15 修复：原版只识别 tick 路径，把 publish.execute_plan 死信也丢进 tick_task
+    → worker 收到的是 tick payload，而 plan_id 在 args[0]、根本不是 run_id，
+    实际行为是「tick 一个不存在的 run id」直接 settle，发布从未真重投。
+
+    分发矩阵（与 ``_publish_execute_with_events`` / ``execute_publish_plan_task`` 对齐）：
+
+    - ``publish.execute_plan``：``args=[plan_id]`` + ``kwargs.user_id``；直接派 publish task
+    - 其余（``pipeline.tick`` / ``pipeline.execute_step`` / ``background.tick``）：
+      由 tick_task 自然 re-claim 死掉的 step，等价于 ``_schedule_tick``
+    """
+
+    task_name = (dead.get("task_name") or "").strip()
+    settings = get_settings()
+
+    # ── publish.execute_plan：路由到正确的 publish task ────────────────────────
+    if task_name == "publish.execute_plan":
+        args = list(dead.get("args_json") or [])
+        kwargs = dict(dead.get("kwargs_json") or {})
+        plan_id = (args[0] if args else None) or kwargs.get("plan_id")
+        # user_id 优先 kwargs（push 时显式带），fallback 到 dlq 行级 user_id
+        user_id = kwargs.get("user_id") or dead.get("user_id")
+        if not plan_id:
+            raise HTTPException(
+                status_code=400,
+                detail="publish.execute_plan dlq item missing plan_id; cannot retry",
+            )
+
+        if settings.celery_enabled:
+            # 局部 import：避免在 web 进程启动时把 celery_app 牵进 router
+            from app.services.pipeline.tasks import execute_publish_plan_task
+
+            execute_publish_plan_task.apply_async(
+                args=[plan_id],
+                kwargs={"user_id": user_id},
+                queue="default",
+            )
+            return "celery"
+
+        # BackgroundTasks fallback：用与 celery task 同体的共享函数，保 SSE 语义一致
+        from app.services.pipeline.tasks import _publish_execute_with_events
+
+        background_tasks.add_task(_publish_execute_with_events, plan_id, user_id)
+        return "background"
+
+    # ── 既有路径：tick_task / runner.tick（pipeline 调度类死信）──────────────
+    run_id = dead.get("run_id")
+    if not run_id:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"dlq item (task={task_name or 'unknown'}) has no run_id; "
+                "cannot dispatch via tick"
+            ),
+        )
+
+    if settings.celery_enabled:
         from app.services.pipeline.tasks import tick_task
 
         tick_task.delay(run_id)
