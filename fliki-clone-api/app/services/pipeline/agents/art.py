@@ -70,6 +70,7 @@ from app.services.model_gateway import (
     get_gateway,
 )
 
+from .. import feature_flags as pipeline_feature_flags
 from ..types import PipelineContext, Step, StepResult, StepStatus, register_agent
 
 logger = logging.getLogger(__name__)
@@ -244,9 +245,30 @@ class ArtAgent(Step):
             consistency_mode = "disabled"
 
         skip_keyframes = bool(brief.get("skip_keyframes"))
-        # v4：把锚点 URL 喂给 _generate_keyframes，主角镜的关键帧将真用 IP-Adapter
+        # ── Track-10 灰度：通过 art_ipadapter_pct flag 决定本 run 是否启用 v4 IP-Adapter ──
+        # value 形态约定：{"pct": 0..100} / {"enabled": bool} / {"variant": "v4"/"v3"}。
+        # is_enabled 命中（True）→ 喂 anchor 给 _generate_keyframes 走 v4 IP-Adapter；
+        # 不命中 → anchor_url 置 None，主角镜降到 v3 prompt-only（前缀注入仍生效）。
+        # 缺省（tenant 没设过 flag）→ 保持当前默认行为（v4），向后兼容。
+        # key=ctx.run_id 让同 tenant 不同 run 之间也按 pct 分流（pct=50 → 一半 run 走 v4）。
+        canary_value = (ctx.feature_flags or {}).get("art_ipadapter_pct")
+        if canary_value is None:
+            canary_v4 = True  # flag 缺省 → 默认 v4
+        else:
+            canary_v4 = pipeline_feature_flags.is_enabled(
+                ctx.tenant_id or "",
+                "art_ipadapter_pct",
+                key=ctx.run_id,
+                flags=ctx.feature_flags,
+            )
+        canary_variant = "v4" if canary_v4 else "v3-prompt-only"
+
         anchor_url_for_keyframes: str | None = None
-        if character_anchor and isinstance(character_anchor.get("url"), str):
+        if (
+            canary_v4
+            and character_anchor
+            and isinstance(character_anchor.get("url"), str)
+        ):
             anchor_url_for_keyframes = character_anchor["url"]
         if not skip_keyframes:
             enriched_shots, kf_cost, keyframe_failures = _generate_keyframes(
@@ -268,6 +290,9 @@ class ArtAgent(Step):
             "consistency_mode": consistency_mode,
             "character_anchor": character_anchor,
             "protagonist_name": protagonist.get("name") if protagonist else None,
+            # Track-10 灰度可观测：让前端 / 调试能知道本 run 实际走了哪一档
+            "canary_variant": canary_variant,
+            "canary_flag_value": canary_value,
         }
         if anchor_warning:
             outputs["consistency_warning"] = anchor_warning

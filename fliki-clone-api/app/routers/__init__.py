@@ -15,6 +15,7 @@ from app.routers.ai import router as ai_router
 from app.routers.dlq import router as dlq_router
 from app.routers.pipelines import router as pipelines_router
 from app.routers.production import router as production_router
+from app.routers.admin_flags import router as admin_flags_router
 
 __all__ = [
     "auth_router",
@@ -35,4 +36,5 @@ __all__ = [
     "pipelines_router",
     "production_router",
     "dlq_router",
+    "admin_flags_router",
 ]

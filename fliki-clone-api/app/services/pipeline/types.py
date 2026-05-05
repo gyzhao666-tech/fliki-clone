@@ -48,6 +48,12 @@ class PipelineContext:
     # 配额 v2 上下文：tenant 命名空间 + 用户 plan（用于 provider 桶 max 派生）
     tenant_id: Optional[str] = None
     tenant_plan: str = "free"
+    # 灰度发布 / canary（Track-10）：tenant 维度的 feature flag 字典；
+    # 按 flag_name 索引，value 为 dict（典型：{"pct": 50} / {"enabled": true} /
+    # {"variant": "v4"}）。runner 在 build ctx 时一次性 load_for_tenant；
+    # agent 内部用 `feature_flags.is_enabled(ctx.tenant_id, name, flags=ctx.feature_flags)`
+    # 决定走哪个版本，避免每次都击 DB。
+    feature_flags: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 class Step:
