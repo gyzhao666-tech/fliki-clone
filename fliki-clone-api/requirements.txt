@@ -38,6 +38,11 @@ fastapi-mail==1.4.1
 # Stripe
 stripe==11.4.0
 
+# PDF rendering（Track-22 月账单 invoice 渲染；轻量纯 Python；无 C 依赖）
+# A4 page + 文字 logo + 表格 + 总金额；reportlab.platypus.SimpleDocTemplate 已经够用。
+# >=4.0 是 pyproject 化版本（Python 3.10 兼容）。CI 强制安装。
+reportlab>=4.0
+
 # Utilities
 python-dotenv==1.0.1
 orjson==3.10.12     # fast JSON
