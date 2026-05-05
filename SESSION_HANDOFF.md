@@ -1,7 +1,26 @@
-# 跨会话交接（2026-05-04 全天 → 2026-05-05 早会话：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1）
+# 跨会话交接（2026-05-04 全天 → 2026-05-05 全天：配额 v2 / VoiceAgent v4 / ArtAgent v3 / 发布执行器 v1 → 多 Agent 并行第一波 7 Track 全合）
 
 > 这一份是"贴到下个会话开头就能无缝接力"的最小集；详细技术点在 `DEVELOPMENT_PLAN.md` 第 13 节。
 > 关键约束 / 已知坑请认真读完再写代码。
+
+> 2026-05-05 12:35 更新：**多 Agent 第一波 7 Track 已合并到 main**（`pytest 31/31 PASS`）。
+> 仓库已 push 到 GitHub: https://github.com/gyzhao666-tech/fliki-clone
+> 合并顺序：02 → 01 → 06 → 04 → 05 → 07 → 08（零冲突 ort 自动合）。
+> 新 alembic head: **`9c2d4e5f6a7b`**（顶 8b1f6c2d4a93，含 `publish_plans.confirm_real_publish` 列）。
+>
+> | Track | 内容 | 关键改动 |
+> |---|---|---|
+> | 01 凭证 Fernet 加密 | `platform_credentials` token 加密落库 + KEY 缺失降级 plain text + warning + 一次性 migrate 脚本 | `app/config.py` + `services/publishing/credentials.py` + `scripts/migrate_encrypt_creds.py` |
+> | 02 YouTube 安全闸门 | `confirm_real_publish` 提到独立列；adapter 不再读 `meta_json.plan_meta`；前端 PlanRow toggle + LIVE 红徽标 | alembic 9c2d4e5f6a7b + `models/production.py` + `adapters/{base,youtube}.py` + `executor.py` + `routers/production.py` + `lib/production.ts` + `pipeline/page.tsx::PlanRow` |
+> | 04 ArtAgent v4 IP-Adapter | `character_anchor.url` 喂入 image provider；不支持时剥离 `image_url` 重试同模型；前端 IP/IP↓ 二级徽标 | `services/model_gateway/providers/siliconflow_image.py`（兼容 image/image_url 双 key + 降级关键词识别） + `agents/art.py::_generate_keyframes` |
+> | 05 VideoAgent v2 | `character_locked=True` 镜用 anchor URL 作 i2v 主参考帧；非主角镜用 keyframe；都缺降级 GENERATE_VIDEO；新输出 `ref_image_source` / `ref_image_url`；前端 RefImageSourceBadge | `agents/video.py` + `pipeline/page.tsx::VideoArtifact` |
+> | 06 faster-whisper 本地 fallback | ASR 路由 `[OPENAI, FASTER_WHISPER_LOCAL, SILICONFLOW]`；本地 word-level 离线；输出格式与 OpenAIWhisper 一致；懒导入 + 单例缓存模型 + env 4 个配置项 | 新 `providers/faster_whisper_local.py` + `gateway.py` + `types.py::ProviderName` + `cost.py` + `requirements.txt` |
+> | 07 Pipeline DAG 视图 | react-flow（@xyflow/react@12）渲染节点 + 连线 + state 颜色 + 列表/DAG toggle + localStorage 记忆 + 点节点滚动到 step 卡片 + 1.5s 蓝色 ring 高亮 | 新 `components/pipeline/dag-view.tsx` + `package.json` + `pipeline/page.tsx` 顶部 ViewToggle |
+> | 08 pytest 工程化 | `tests/` 目录 + conftest fixture（pg_engine / temp_tenant / fake_gateway 等）+ 4 个测试模块（quota_v2 / voice_v4 / art_v3 / publishing）+ 7 个 marker（unit/integration/publishing/quota/voice/art/slow）+ Makefile 加 `test` / `test-unit` / `test-integration` target | `tests/{conftest,test_quota_v2,test_voice_v4,test_art_v3,test_publishing}.py` + `pytest.ini` + `requirements-dev.txt` + `Makefile` |
+>
+> Track-03（publish 异步化）依赖 02，本次未启动；可在第二波派发。
+>
+> **整体能力扩展**：YouTube 真发的 toggle 已暴露在 UI（confirm_real_publish 列）；本地 ASR 离线不依赖 OpenAI key；主角跨镜锁定从纯 prompt 升级到「IP-Adapter 接入点 + i2v 主参考帧」联动。
 
 > 2026-05-05 11:30 更新：**发布执行器 v1 已落地**。新表 `platform_credentials`（alembic head
 > `8b1f6c2d4a93`）+ `app/services/publishing/`（adapter 协议 + dry-run / youtube / bilibili
@@ -13,7 +32,8 @@
 > 端到端测：dry-run 完整链路（reserve→execute→external_id 写回）✓ / youtube 无凭证
 > 友好错误 ✓ / bilibili stub 引导手动上传 ✓ / 未知平台 fallback dry-run ✓ / 重复 execute
 > 拒绝 ✓。YouTube 真发需 `.env` 配 `GOOGLE_CLIENT_ID/SECRET`；v1 内置「安全闸门」：
-> 默认不真发，除非 `plan.meta_json.confirm_real_publish=true`。
+> 默认不真发；Track-02 把开关从 `meta_json.confirm_real_publish` 提到独立列
+> `publish_plans.confirm_real_publish` + 前端 PlanRow 加 toggle（见上方 Track-02 行）。
 >
 > 2026-05-05 10:45 更新：**ArtAgent v3 角色一致性已落地**。引入「锚点参考板 + prompt 锁定」
 > 双层方案：(1) `_generate_character_anchor` 单独为主角调一次 GENERATE_IMAGE 出 1:1 参考板，
@@ -68,8 +88,10 @@
 
 ## 2026-05-05 当前进程（最新）
 
-- **后端 pid 59135**（启于 2026-05-05 11:13；监听 `127.0.0.1:8000`，无 proxy 污染，alembic head
-  `8b1f6c2d4a93`；已加载配额 v2 + VoiceAgent v4 + ArtAgent v3 + 发布执行器 v1）
+- **后端 pid 59135**（启于 2026-05-05 11:13；监听 `127.0.0.1:8000`，无 proxy 污染；
+  **重启后** alembic head `9c2d4e5f6a7b`；已加载配额 v2 + VoiceAgent v4 +
+  ArtAgent v3/v4 IP-Adapter + 发布执行器 v1 含 confirm_real_publish 列 +
+  faster-whisper 本地 fallback + Fernet 凭证加密）
 - **前端 pid 5186**（next dev，3000 端口，hot-reload 改动无需重启）
 
 **重要**：用户自己重启 backend 时记得 `cd /Users/zhaoguangyuan/project/empty/fliki-clone-api &&
@@ -211,7 +233,8 @@ Brief
 | **`tenant_quotas`** | 配额 v2：(tenant_id) 主键的月度配额（plan-derived limit / concurrent_max / display_name）；router/runner 已切到这里，v1 `model_quotas` 仅作兼容 | `c2f9b7a04ef1` |
 | **`provider_concurrency_buckets`** | (tenant_id, provider_name) 唯一；acquire/release 由 gateway.run() 自动维护；plan 升级时自动 bump max_concurrent | 同上 |
 | **`pipeline_runs.tenant_id`** | run 级的 tenant 命名空间；终态退还走它而非 user_id | 同上 |
-| **`platform_credentials`** | 发布执行器 v1：(user_id, platform) 唯一；存 access/refresh token + scope + expires_at；v1 plain text，生产应套 Fernet 加密 | **`8b1f6c2d4a93`** ← head |
+| **`platform_credentials`** | 发布执行器 v1：(user_id, platform) 唯一；存 access/refresh token + scope + expires_at；**Track-01 已套 Fernet 加密**（KEY 缺失时降级 plain text + warning） | `8b1f6c2d4a93` |
+| **`publish_plans.confirm_real_publish`** | bool 列，default false；Track-02 把 v1 隐藏在 meta_json 的安全闸门提出来；adapter 直接读，前端 PlanRow toggle | **`9c2d4e5f6a7b`** ← head |
 
 ### 2.2 Model Gateway（`app/services/model_gateway/`）
 - 统一类型 `ModelAction` / `ProviderName` / `RenderRequest` / `RenderResult` / `CallStatus`
@@ -429,7 +452,8 @@ fliki-clone-api/
 │   ├── 20260504_2000_add_production_tables.py  (rev a4d72b91e3c5)
 │   ├── 20260504_2030_add_dead_letter_tasks.py  (rev e58c4a1d2b73)
 │   ├── 20260505_0900_add_tenant_quota_and_provider_buckets.py (rev c2f9b7a04ef1)
-│   └── 20260505_1100_add_platform_credentials.py (rev 8b1f6c2d4a93)  ← head
+│   ├── 20260505_1100_add_platform_credentials.py (rev 8b1f6c2d4a93)
+│   └── 20260505_1200_add_publish_plan_confirm_real.py (rev 9c2d4e5f6a7b)  ← head
 ├── app/
 │   ├── main.py
 │   ├── config.py
@@ -549,17 +573,20 @@ Redis 在跑（`redis-cli ping → PONG`）。
 ```
 延续 2026-05-04 + 05-05 会话；交接见 /Users/zhaoguangyuan/project/empty/SESSION_HANDOFF.md。
 当前能跑 video_full 端到端：字幕硬烧 / 配额 v2 tenant 级分桶 + provider 并发桶 / Celery 双模式 /
-SSE 流式状态 / EditAgent v5 / VoiceAgent v4 word-level 强对齐（需 OPENAI_API_KEY）/
-ArtAgent v3 角色一致性（锚点参考板 + prompt 锁定 + 防漂 negative）/ ADR-002 /
-数据模型扩展 v1（9 表 + persist 双写 + 生产 router）/ 前端切 /api/production/* 新 API + Tenant 视图
-+ Provider 桶 + 版本 / 发布 panel / 角色一致性可视化 / VoiceAgent v4 word 时间轴 /
-DLQ panel / 发布执行器 v1（dry-run / youtube / bilibili adapter + executor + OAuth + PlanRow 执行按钮 +
-PlatformCredentialsPanel）。
-请直接做：(A) YouTube 真发安全闸门 + 前端开关（半天，加 confirm_real_publish 列）；
-(B) 凭证 Fernet 加密（半天）；(C) ArtAgent v4 IP-Adapter 真接入（1.5 天，需 SiliconFlow Kolors-IP / Flux Redux）；
-(D) publish 任务异步化（半天，celery + SSE plan_state）。除非我另说。
-开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 8b1f6c2d4a93；
-            (3) 启动后端不带 --reload；(4) backend pid 59135（监听 127.0.0.1:8000），前端 pid 5186。
+SSE 流式状态 / EditAgent v5 / VoiceAgent v4 word-level 强对齐（OpenAI Whisper 或本地 faster-whisper）/
+ArtAgent v3+v4 角色一致性（锚点参考板 + prompt 锁定 + IP-Adapter 接入点）/ VideoAgent v2（i2v 主参考帧用 anchor）/
+ADR-002 / 数据模型扩展 v1（10 表 + persist 双写 + 生产 router）/ 前端切 /api/production/* +
+Tenant 视图 + Provider 桶 + 版本 / 发布 panel + DLQ panel + DAG 视图 + 角色一致性 / 字幕 word 时间轴 /
+发布执行器 v1（dry-run / youtube / bilibili adapter + executor + OAuth + PlatformCredentialsPanel +
+publish_plans.confirm_real_publish 列 + Fernet 凭证加密）/ pytest 31 case 全过。
+仓库：https://github.com/gyzhao666-tech/fliki-clone（monorepo）。
+请直接做：(A) Track-03 publish 任务异步化（celery + SSE plan_state，半天）；
+(B) Track-09 多角色锁定（依赖 Track-04，1 天）；
+(C) Track-10 灰度发布 / canary（依赖 Track-01，1.5 天）；
+(D) Track-11 Stripe 计费对接（依赖 Track-01，2 天）。除非我另说。
+开始前确认：(1) backend cwd 是 fliki-clone-api；(2) alembic head 是 9c2d4e5f6a7b；
+            (3) 启动后端不带 --reload；(4) `cd fliki-clone-api && make test` 应 31 PASS；
+            (5) 多 Agent 协作见 AGENTS_BACKLOG.md（仓库根）。
 ```
 
 ## 11. 怎么试 v4 多比例（最快）
