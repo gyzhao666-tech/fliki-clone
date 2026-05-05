@@ -35,6 +35,8 @@ class ProviderName(str, Enum):
     KLING = "kling"
     ELEVENLABS = "elevenlabs"
     OPENAI = "openai"
+    # 本地 faster-whisper（懒导入；用户无 OPENAI_API_KEY 时的 word-level fallback）
+    FASTER_WHISPER_LOCAL = "faster_whisper_local"
     DEMO = "demo"  # 无 key 时的本地占位，便于离线开发与测试
 
 

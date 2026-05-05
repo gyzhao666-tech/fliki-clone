@@ -43,3 +43,10 @@ pillow==11.0.0      # image processing
 # Telegram crawler
 PySocks==1.7.1
 Telethon==1.43.2
+
+# ── Optional: 本地 ASR (Track-06 fallback) ──────────────────────────────
+# 体积大（CTranslate2 + 模型权重首次推理 ~150MB），仅当用户没有
+# OPENAI_API_KEY 又想要 word-level 字幕时才需要安装；安装后 gateway ASR
+# 路由自动落到 FasterWhisperLocalProvider。CI 不强制安装。
+# 用 ">=" 而非锁版本，让 macOS / linux / cuda 用户各自挑合适 wheel。
+faster-whisper>=1.0  # optional, see app/services/model_gateway/providers/faster_whisper_local.py
