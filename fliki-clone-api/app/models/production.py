@@ -257,6 +257,12 @@ class PublishPlan(Base):
     meta_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
+    # 安全闸门：独立列（取代 v1 的 meta_json.confirm_real_publish）。
+    # adapter 直接读这一列决定走 mock 路径还是真发路径；前端 PlanRow 暴露 toggle。
+    confirm_real_publish: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
