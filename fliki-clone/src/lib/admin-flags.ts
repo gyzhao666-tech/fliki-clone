@@ -43,8 +43,21 @@ export interface TenantsListOut {
   known_flags: Record<string, string>;
 }
 
+/**
+ * `/admin/feature-flags/me` 探测端点响应。
+ *
+ * Track-27 起新加 `role` / `is_editor` / `is_viewer` 三字段，让前端按 role 灰化按钮。
+ *
+ * - `is_admin`：保留 Track-14 既有语义（含邮箱白名单 fallback）；sidebar 只看这一个
+ * - `is_editor`：仅 team_members.role in (admin, editor) 命中（**不**走邮箱兜底）
+ * - `is_viewer`：team_members 任意行命中（**不**走邮箱兜底）
+ * - `role`：用户最高 role（admin > editor > viewer）；没在任何 workspace 登记 → null
+ */
 export interface AdminMeOut {
   is_admin: boolean;
+  is_editor: boolean;
+  is_viewer: boolean;
+  role: "admin" | "editor" | "viewer" | null;
   email: string | null;
 }
 

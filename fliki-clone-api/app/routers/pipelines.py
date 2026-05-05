@@ -16,13 +16,14 @@ import logging
 import uuid
 from typing import Any, AsyncIterator, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
 
 from app.config import get_settings
 from app.deps import CurrentUser
+from app.services.auth.rbac import require_role
 from app.services.pipeline import agents as _agents  # noqa: F401  触发 agent 自注册
 from app.services.pipeline import events as pipeline_events
 from app.services.pipeline import templates as pipeline_templates
@@ -44,6 +45,10 @@ from app.services.pipeline.runner import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Track-27 · pipeline 写权限：admin / editor 都能启停 / 推进；viewer 只能读
+_writer_required = Depends(require_role(["admin", "editor"]))
 
 
 def _schedule_tick(run_id: str, background_tasks: BackgroundTasks) -> str:
@@ -216,7 +221,12 @@ def _ensure_run_owner(run_id: str, user_id: str) -> None:
 # ── routes ────────────────────────────────────────────────────────────────────
 
 
-@router.post("", response_model=RunOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=RunOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_writer_required],
+)
 async def start_pipeline(
     body: StartPipelineRequest,
     current_user: CurrentUser,
@@ -527,7 +537,9 @@ async def pipeline_events_stream(
     )
 
 
-@router.post("/{run_id}/tick", response_model=RunOut)
+@router.post(
+    "/{run_id}/tick", response_model=RunOut, dependencies=[_writer_required]
+)
 async def tick_pipeline(run_id: str, current_user: CurrentUser) -> RunOut:
     _ensure_run_owner(run_id, current_user.id)
     tick(run_id)
@@ -536,7 +548,11 @@ async def tick_pipeline(run_id: str, current_user: CurrentUser) -> RunOut:
     return out
 
 
-@router.post("/{run_id}/steps/{name}/rerun", response_model=StepOut)
+@router.post(
+    "/{run_id}/steps/{name}/rerun",
+    response_model=StepOut,
+    dependencies=[_writer_required],
+)
 async def rerun_pipeline_step(
     run_id: str,
     name: str,
@@ -552,7 +568,11 @@ async def rerun_pipeline_step(
     return next(s for s in out.steps if s.id == step_id)
 
 
-@router.post("/{run_id}/steps/{name}/approve", response_model=RunOut)
+@router.post(
+    "/{run_id}/steps/{name}/approve",
+    response_model=RunOut,
+    dependencies=[_writer_required],
+)
 async def approve_pipeline_step(
     run_id: str,
     name: str,
@@ -583,7 +603,9 @@ async def approve_pipeline_step(
     return out
 
 
-@router.post("/{run_id}/cancel", response_model=RunOut)
+@router.post(
+    "/{run_id}/cancel", response_model=RunOut, dependencies=[_writer_required]
+)
 async def cancel_pipeline(run_id: str, current_user: CurrentUser) -> RunOut:
     _ensure_run_owner(run_id, current_user.id)
     refund_tenant_id: Optional[str] = None

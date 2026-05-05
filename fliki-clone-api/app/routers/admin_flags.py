@@ -154,27 +154,83 @@ class TenantsListOut(BaseModel):
 
 
 class AdminMeOut(BaseModel):
-    """前端 `Sidebar` 探测端点；非 admin 也能调，不抛 403，避免污染开发台。"""
+    """前端 `Sidebar` 探测端点；非 admin 也能调，不抛 403，避免污染开发台。
+
+    Track-27 起新加 `role` / `is_editor` / `is_viewer` 三字段，让前端按钮按
+    role 灰化（viewer 不能点 / editor 不能点 admin-only 计费）。
+    `is_admin` 字段保留（与 Track-14/24 既有 7 case 兼容；前端 sidebar 仍只看 is_admin）。
+
+    role 字段语义
+    -------------
+    - `"admin"` / `"editor"` / `"viewer"`：在某 workspace 真有 team_members 行；
+      没显式 `workspace_id` 时，返「用户最高的那一档」（admin > editor > viewer）
+    - `null`：用户没在任何 workspace 登记 team_members（dev / 邮箱 fallback admin）
+      但 `is_admin` 仍可能是 True（走邮箱白名单 fallback）
+    """
 
     is_admin: bool
+    is_editor: bool = False
+    is_viewer: bool = False
+    role: Optional[str] = None
     email: Optional[str] = None
 
 
 # ── 路由 ─────────────────────────────────────────────────────────────────────
 
 
+def _resolve_user_top_role(current_user: CurrentUser) -> Optional[str]:
+    """返用户在「任意 workspace」中的最高 role（admin > editor > viewer）。
+
+    Track-27 新加：让前端 `useCurrentRole` 一次拿到 role 就能决定按钮启用
+    / 灰化，不必再二次探测。
+
+    注意：本函数读 `team_members` 一次（无缓存；rbac 模块自己有 60s cache
+    覆盖 `get_user_role`，但本聚合函数走的是单独 SQL，频率极低不缓存）。
+    """
+    uid = getattr(current_user, "id", None)
+    if not uid:
+        return None
+    try:
+        engine = create_engine(get_settings().database_url_sync)
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT DISTINCT role FROM team_members WHERE user_id = :uid"),
+                {"uid": uid},
+            ).fetchall()
+            roles = {str(r[0]).lower() for r in rows if r[0]}
+    except Exception:  # pragma: no cover
+        logger.exception("_resolve_user_top_role failed user=%s", uid)
+        return None
+    if "admin" in roles:
+        return "admin"
+    if "editor" in roles:
+        return "editor"
+    if "viewer" in roles:
+        return "viewer"
+    return None
+
+
 @router.get("/me", response_model=AdminMeOut)
 async def admin_self_check(current_user: CurrentUser) -> AdminMeOut:
-    """登录用户探测自己是否 admin。
+    """登录用户探测自己是否 admin / editor / viewer。
 
     单独留 endpoint 而不复用 `/me` 是为了：
     1. 不越界改 `app/routers/auth.py` 的 UserOut（互斥锁规则 1.4 / 1.5 之外，
        schemas 改动也有跨 Track 影响半径）
     2. 让前端 `Sidebar` 单次轻量探测就能决定是否渲染 admin 入口
        （非 admin 不会拉 `/tenants` 列表，避免一进 app 就触发 403 噪音）
+
+    Track-27 起新加 `role` / `is_editor` / `is_viewer` 字段：
+    - `is_admin`：保留 Track-14 既有语义（含邮箱白名单 fallback）
+    - `is_editor`：仅 team_members.role in (admin, editor) 命中（**不**走邮箱兜底）
+    - `is_viewer`：team_members 任意行命中（**不**走邮箱兜底）
+    - `role`：用户最高 role（admin > editor > viewer），用于 tooltip 文案
     """
     return AdminMeOut(
         is_admin=_is_admin_user(current_user),
+        is_editor=rbac.is_editor(current_user.id),
+        is_viewer=rbac.is_viewer(current_user.id),
+        role=_resolve_user_top_role(current_user),
         email=current_user.email,
     )
 

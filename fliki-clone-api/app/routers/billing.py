@@ -25,7 +25,7 @@ import logging
 from typing import Optional
 
 import stripe
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
@@ -37,6 +37,7 @@ from app.schemas import (
     CheckoutResponse,
     PortalResponse,
 )
+from app.services.auth.rbac import require_role
 from app.services.billing import (
     StripeNotConfigured,
     create_checkout_session,
@@ -51,6 +52,12 @@ logger = logging.getLogger(__name__)
 
 
 router = APIRouter(tags=["Billing"])
+
+# Track-27 · 计费写权限：admin only（含邮箱白名单 fallback，与 _require_admin 一致）
+# - editor 也无法发起 checkout / portal，避免「拿到编辑权限的成员」点错误升级链接
+# - GET /billing/plan 不挂 require_role，editor / viewer 都能看自己的额度
+# - /billing/webhook 由 stripe 调用（无 user 上下文），自然走签名校验，不需 RBAC
+_admin_required = Depends(require_role(["admin"]))
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
@@ -120,7 +127,11 @@ async def get_billing_plan(current_user: CurrentUser, db: DB) -> BillingPlanV2Ou
 # ── /billing/checkout-session ───────────────────────────────────────────────
 
 
-@router.post("/billing/checkout-session", response_model=CheckoutResponse)
+@router.post(
+    "/billing/checkout-session",
+    response_model=CheckoutResponse,
+    dependencies=[_admin_required],
+)
 async def create_checkout_session_endpoint(
     body: CheckoutRequest, current_user: CurrentUser, db: DB
 ) -> CheckoutResponse:
@@ -171,7 +182,11 @@ async def create_checkout_legacy(
 # ── /billing/portal-session ─────────────────────────────────────────────────
 
 
-@router.post("/billing/portal-session", response_model=PortalResponse)
+@router.post(
+    "/billing/portal-session",
+    response_model=PortalResponse,
+    dependencies=[_admin_required],
+)
 async def create_portal_session_endpoint(
     current_user: CurrentUser, db: DB
 ) -> PortalResponse:

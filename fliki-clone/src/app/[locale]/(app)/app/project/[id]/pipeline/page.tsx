@@ -50,6 +50,9 @@ import {
   type SubtitleWithWords,
   type WordTimestamp,
 } from "@/hooks/use-audio-current-word";
+// Track-27 · RBAC editor/viewer 写权限分级：viewer 看到的写按钮 disable + tooltip
+import { useCurrentRole } from "@/hooks/use-current-role";
+import { canWrite, disabledReason } from "@/lib/role";
 import { useRunRenders } from "@/hooks/use-run-renders";
 import { useRunShotList } from "@/hooks/use-run-shot-list";
 import { useDlq } from "@/hooks/use-dlq";
@@ -170,6 +173,11 @@ export default function ProjectPipelinePage() {
     enabled: !!run && !isRunTerminal(run.state),
     onUpdate: setRun,
   });
+
+  // Track-27 · 当前用户 role 探测：viewer 无写权限，启动 / 另存版本 / 新建发布计划等按钮 disable
+  const role = useCurrentRole();
+  const writeAllowed = canWrite(role, role.loading);
+  const writeDisabledReason = disabledReason(role, role.loading);
 
   // shot-list 拉新表数据，供 art / video step 卡片优先消费（含每镜 art prompt + video URL 合并）。
   // 监听 art / video step state 变化时 reload —— persist 在 SSE publish 之前同步，重拉一定能拿到最新。
@@ -411,7 +419,8 @@ export default function ProjectPipelinePage() {
             ) : null}
             <Button
               onClick={handleStart}
-              disabled={starting || !startGate.canStart}
+              disabled={starting || !startGate.canStart || !writeAllowed}
+              title={writeDisabledReason ?? undefined}
             >
               {starting ? (
                 <>
@@ -2174,6 +2183,10 @@ function VersionsBlock({
   versions: VersionOut[];
   onChanged: () => void;
 }) {
+  // Track-27 · viewer 不能另存版本 / 删除版本（按钮 disable + tooltip）
+  const role = useCurrentRole();
+  const writeAllowed = canWrite(role, role.loading);
+  const writeDisabledReason = disabledReason(role, role.loading);
   const [showForm, setShowForm] = useState(false);
   const [label, setLabel] = useState("");
   const [notes, setNotes] = useState("");
@@ -2219,11 +2232,13 @@ function VersionsBlock({
           size="sm"
           variant={showForm ? "ghost" : "outline"}
           onClick={() => setShowForm((v) => !v)}
-          disabled={!canCreate}
+          disabled={!canCreate || !writeAllowed}
           title={
-            canCreate
-              ? "把当前 run 标记为一个版本"
-              : "需要当前 run 处于 succeeded 状态才能另存为版本"
+            !writeAllowed
+              ? (writeDisabledReason ?? undefined)
+              : canCreate
+                ? "把当前 run 标记为一个版本"
+                : "需要当前 run 处于 succeeded 状态才能另存为版本"
           }
         >
           <Plus className="size-3.5" />
@@ -2302,6 +2317,10 @@ function VersionRow({
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // Track-27 · viewer 不能 publish / 删除版本
+  const role = useCurrentRole();
+  const writeAllowed = canWrite(role, role.loading);
+  const writeDisabledReason = disabledReason(role, role.loading);
   const handlePublish = useCallback(async () => {
     setBusy(true);
     try {
@@ -2355,8 +2374,10 @@ function VersionRow({
           size="sm"
           variant="ghost"
           onClick={handlePublish}
-          disabled={busy}
-          title="把这个版本设为当前发布版"
+          disabled={busy || !writeAllowed}
+          title={
+            writeDisabledReason ?? "把这个版本设为当前发布版"
+          }
         >
           置顶
         </Button>
@@ -2365,8 +2386,8 @@ function VersionRow({
         size="sm"
         variant="ghost"
         onClick={handleDelete}
-        disabled={busy}
-        title="删除版本"
+        disabled={busy || !writeAllowed}
+        title={writeDisabledReason ?? "删除版本"}
       >
         <Trash2 className="size-3.5" />
       </Button>
@@ -2393,6 +2414,10 @@ function PublishPlansBlock({
   const [title, setTitle] = useState("");
   const [scheduledAt, setScheduledAt] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  // Track-27 · viewer 不能新建发布计划
+  const role = useCurrentRole();
+  const writeAllowed = canWrite(role, role.loading);
+  const writeDisabledReason = disabledReason(role, role.loading);
 
   const onSubmit = useCallback(async () => {
     setSubmitting(true);
@@ -2432,6 +2457,8 @@ function PublishPlansBlock({
           size="sm"
           variant={showForm ? "ghost" : "outline"}
           onClick={() => setShowForm((v) => !v)}
+          disabled={!writeAllowed}
+          title={writeDisabledReason ?? undefined}
         >
           <Plus className="size-3.5" />
           {showForm ? "收起" : "新建发布计划"}
@@ -2510,6 +2537,10 @@ function PlanRow({
   onChanged: () => void;
 }) {
   const [busy, setBusy] = useState(false);
+  // Track-27 · viewer 不能执行 / 删除发布计划 / 改 status / 切真发开关
+  const role = useCurrentRole();
+  const writeAllowed = canWrite(role, role.loading);
+  const writeDisabledReason = disabledReason(role, role.loading);
   // 乐观更新：toggle 真发后立刻更 UI，让 Upload 按钮颜色立刻反映闸门状态，
   // 等服务器 PATCH 回来再用 onChanged 拉权威值刷一次。
   const [confirmReal, setConfirmReal] = useState(plan.confirm_real_publish);
@@ -2643,7 +2674,8 @@ function PlanRow({
     : "调用发布执行器：把 render 真推到目标平台（dry-run / bilibili / youtube）";
 
   // Track-03：execute 进 worker 后，整行所有按钮都禁掉避免重复派发
-  const rowBusy = busy || executing;
+  // Track-27：viewer 不能写，整行按钮额外 disable
+  const rowBusy = busy || executing || !writeAllowed;
   // executing 时的状态徽标：phase=running → 「执行中（celery/polling）」
   // 没收到 phase 但 mode=stream → 「派发中…」
   const execBadge = executing ? (
@@ -2747,9 +2779,11 @@ function PlanRow({
             onClick={handleExecute}
             disabled={rowBusy}
             title={
-              executing
-                ? "执行中（worker 跑 publish.execute_plan）；等 SSE 推 phase=completed"
-                : uploadBtnTitle
+              !writeAllowed
+                ? (writeDisabledReason ?? undefined)
+                : executing
+                  ? "执行中（worker 跑 publish.execute_plan）；等 SSE 推 phase=completed"
+                  : uploadBtnTitle
             }
           >
             {executing ? (
@@ -2765,7 +2799,10 @@ function PlanRow({
             variant="ghost"
             onClick={() => handleStatus("published")}
             disabled={rowBusy}
-            title="仅状态记账（不调发布执行器；适合手动发完后回填）"
+            title={
+              writeDisabledReason ??
+              "仅状态记账（不调发布执行器；适合手动发完后回填）"
+            }
           >
             <Send className="size-3.5" />
           </Button>
@@ -2775,7 +2812,7 @@ function PlanRow({
           variant="ghost"
           onClick={handleDelete}
           disabled={rowBusy}
-          title="删除发布计划"
+          title={writeDisabledReason ?? "删除发布计划"}
         >
           <Trash2 className="size-3.5" />
         </Button>

@@ -10,12 +10,21 @@
  *
  * tenant 视图（monthly_limit_usd / concurrent_max）来自 v2 tenant_quotas，
  * webhook 处理完会立刻 bump，所以用户支付完跳回时刷新一下就能看到新额度。
+ *
+ * Track-27 RBAC 写权限分级
+ * ------------------------
+ * 计费写端点（checkout-session / portal-session）后端已挂 ``require_role(["admin"])``：
+ * 非 admin 调用会 403。前端这里同样按 ``role.isAdmin`` 灰化「Upgrade to ...」+
+ * 「Manage in portal」按钮 + tooltip "需要 admin 权限"，避免普通成员误点出 403。
+ * 「Refresh」按钮不 disable（GET /billing/plan 不限 admin）。
  */
 import { useCallback, useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { useCurrentRole } from "@/hooks/use-current-role";
 import { api, ApiError } from "@/lib/api";
+import { canManageBilling, disabledReason } from "@/lib/role";
 import { cn } from "@/lib/utils";
 import { Check, ExternalLink, Loader2, RefreshCw } from "lucide-react";
 
@@ -101,6 +110,12 @@ export default function AppBillingPage() {
   const [error, setError] = useState<string | null>(null);
   const [pendingPlan, setPendingPlan] = useState<PlanKey | null>(null);
   const [pendingPortal, setPendingPortal] = useState(false);
+  // Track-27 · 计费写端点仅 admin（与后端 require_role(["admin"]) 对齐）
+  const role = useCurrentRole();
+  const adminAllowed = canManageBilling(role, role.loading);
+  const adminDisabledReason = disabledReason(role, role.loading, {
+    adminOnly: true,
+  });
 
   const fetchPlan = useCallback(async () => {
     try {
@@ -261,7 +276,8 @@ export default function AppBillingPage() {
               variant="outline"
               size="sm"
               onClick={onManagePortal}
-              disabled={pendingPortal}
+              disabled={pendingPortal || !adminAllowed}
+              title={adminDisabledReason ?? undefined}
               className="gap-1.5"
             >
               {pendingPortal ? (
@@ -325,7 +341,9 @@ export default function AppBillingPage() {
             const disabled =
               isCurrent ||
               pendingPlan === p.key ||
-              (p.key === "free" && !data?.stripe_customer_id);
+              (p.key === "free" && !data?.stripe_customer_id) ||
+              !adminAllowed;
+            const titleText = !adminAllowed ? adminDisabledReason : undefined;
 
             return (
               <div
