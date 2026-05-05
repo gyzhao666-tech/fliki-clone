@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import {
   AudioLines,
   Bot,
@@ -13,10 +14,12 @@ import {
   Megaphone,
   Palette,
   PlaySquare,
+  ShieldCheck,
   Users,
   Zap,
 } from "lucide-react";
 import { Link, usePathname } from "@/i18n/navigation";
+import { getAdminMe } from "@/lib/admin-flags";
 import { cn } from "@/lib/utils";
 
 const primaryNav = [
@@ -66,7 +69,32 @@ function NavLink({
   );
 }
 
+/**
+ * 探测当前用户是否 admin（命中 ADMIN_EMAILS 白名单）。
+ *
+ * 设计：onMount 单次轻量探测；非 admin / 错误一律静默隐藏入口（不污染开发台）。
+ * 本页 + 路由本身都有 admin 鉴权兜底，前端隐藏只是降噪 UX。
+ */
+function useIsAdmin(): boolean {
+  const [isAdmin, setIsAdmin] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    getAdminMe()
+      .then((me) => {
+        if (!cancelled) setIsAdmin(Boolean(me.is_admin));
+      })
+      .catch(() => {
+        if (!cancelled) setIsAdmin(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  return isAdmin;
+}
+
 export function Sidebar() {
+  const isAdmin = useIsAdmin();
   return (
     <aside className="hidden h-screen w-80 shrink-0 flex-col border-r border-[var(--border)] bg-[var(--surface)] md:flex">
       <div className="flex h-20 shrink-0 items-center gap-4 border-b border-[var(--border)] px-7 py-5">
@@ -94,6 +122,21 @@ export function Sidebar() {
             ))}
           </div>
         </div>
+
+        {isAdmin && (
+          <div>
+            <p className="px-5 pb-3 text-sm font-bold uppercase tracking-wider text-[var(--text-muted)]">
+              Admin
+            </p>
+            <div className="space-y-2">
+              <NavLink
+                href="/app/admin/feature-flags"
+                label="Feature Flags"
+                icon={ShieldCheck}
+              />
+            </div>
+          </div>
+        )}
       </nav>
 
       <div className="border-t border-[var(--border)] p-3">
